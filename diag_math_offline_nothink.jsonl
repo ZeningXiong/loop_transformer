@@ -1,0 +1,8 @@
+{"q": "13 乘以 17 再减去 29 等于多少？只回答数字。", "expect": "192", "ok": false, "final": "214", "full": "214", "tokens": 4, "sec": 14.6, "tok_per_s": 0.27}
+{"q": "48 乘以 25 等于多少？只回答数字。", "expect": "1200", "ok": true, "final": "1200", "full": "1200", "tokens": 5, "sec": 0.9, "tok_per_s": 5.36}
+{"q": "1234 加 5678 等于多少？只回答数字。", "expect": "6912", "ok": true, "final": "6912", "full": "6912", "tokens": 5, "sec": 0.6, "tok_per_s": 7.9}
+{"q": "15 乘以 15 再减去 17 等于多少？只回答数字。", "expect": "208", "ok": true, "final": "208", "full": "208", "tokens": 4, "sec": 0.5, "tok_per_s": 7.55}
+{"q": "391 除以 17 等于多少？只回答数字。", "expect": "23", "ok": true, "final": "23", "full": "23", "tokens": 3, "sec": 0.4, "tok_per_s": 7.88}
+{"q": "2 的 10 次方减去 100 等于多少？只回答数字。", "expect": "924", "ok": false, "final": "1023", "full": "1023", "tokens": 5, "sec": 0.7, "tok_per_s": 6.91}
+{"q": "37 乘以 43 等于多少？只回答数字。", "expect": "1591", "ok": true, "final": "1591", "full": "1591", "tokens": 5, "sec": 0.6, "tok_per_s": 7.8}
+{"q": "(85 - 37) 乘以 6 等于多少？只回答数字。", "expect": "288", "ok": false, "final": "222", "full": "222", "tokens": 4, "sec": 0.5, "tok_per_s": 7.29}

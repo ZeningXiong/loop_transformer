@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# 虚拟环境
+.venv/
+venv/
+
+# 日志与临时输出
+logs/
+*.log
+
+# 模型权重（体积大，不入库；用 convert_*.py 从原始检查点生成）
+*.safetensors
+*.bin
+*.pt
+*.gguf
+models/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 本地缓存
+.cache/
+.pytest_cache/
