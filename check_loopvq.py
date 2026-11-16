@@ -1,4 +1,4 @@
-﻿"""Low-cost feasibility test of LoopVQ (arXiv 2611.05304) on SenseNova-Loop-9B.
+"""Low-cost feasibility test of LoopVQ (arXiv 2611.05304) on SenseNova-Loop-9B.
 
 Question: does coding the two loop passes of a full-attention layer jointly ("loop" grouping: G/2 channels x 2
 passes per 8-bit code) beat coding each pass alone ("channel" grouping: G channels x 1 pass) at the same bitwidth?
@@ -22,6 +22,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 OUT = r"D:\models\_loopvq_tmp"
 os.makedirs(OUT, exist_ok=True)
 CHUNK, MAXLEN, SINK = 512, 16384, 8
+WIN, TOTAL = 0, 0  # 最近 WIN 个 token 保持精确（0 = 全部量化）
 KCODE = 256  # 8-bit codes, as in the paper
 GS = (4, 8, 16, 32)  # 2, 1, 0.5, 0.25 bits per element
 KL_CFGS = ["int8", "int4", "loop_G4", "chan_G4", "loop_G8", "chan_G8", "loop_G16", "chan_G16"]
@@ -68,10 +69,13 @@ class Hooks:
                 self.store.setdefault((layer, p, kv), []).append(x.to("cpu", torch.bfloat16))
             elif self.mode == "replace" and self.visits[layer] == 2:
                 s, e = self.span
-                r = self.repl[(layer, p, kv)][s:e].to(out.device, out.dtype)  # [T, H, D]
                 lo = max(0, SINK - s)  # keep sink tokens exact
+                hi = e - s if WIN <= 0 else max(0, min(e, TOTAL - WIN) - s)  # [hi, ) 留精确
+                if hi <= lo:
+                    return None
+                r = self.repl[(layer, p, kv)][s:e].to(out.device, out.dtype)  # [T, H, D]
                 new = out.clone()
-                new.view(1, e - s, 4, -1)[0, lo:] = r[lo:]
+                new.view(1, e - s, 4, -1)[0, lo:hi] = r[lo:hi]
                 return new
             return None
         return hook
@@ -328,6 +332,53 @@ def phase_gen():
     guard.close()
 
 
+def _long_ids(tok):
+    """16K 的单条长序列（不存在就现生成）。"""
+    path = "_lq_held.jsonl"
+    if not os.path.exists(path):
+        ts = [json.loads(l)["text"] for l in open("eval_texts_heldout.jsonl", encoding="utf-8")]
+        ids0 = tok("".join(ts * 60), add_special_tokens=False)["input_ids"][:16300]
+        json.dump({"text": tok.decode(ids0)}, open(path, "w", encoding="utf-8"), ensure_ascii=False)
+    return tokenize(tok, path)[0]
+
+
+def phase_ref96():
+    tok, model, guard, cache = load_model()
+    hooks = Hooks(model)
+    ids = _long_ids(tok)
+    h = run_seq(model, hooks, ids, cache)
+    with torch.inference_mode():
+        lg = model.lm_head(h[-96:].cuda()).float()
+    torch.save(lg.half().cpu(), os.path.join(OUT, "ref96.pt"))
+    print(f"ref96 已保存 | 整卡 {guard.peak / 1e9:.2f} GB", flush=True)
+    guard.close()
+
+
+def phase_win96():
+    global WIN, TOTAL
+    tok, model, guard, cache = load_model()
+    hooks = Hooks(model)
+    ids = _long_ids(tok)
+    TOTAL = int(ids.shape[1])
+    ref = torch.load(os.path.join(OUT, "ref96.pt"), weights_only=True).cuda().float()
+    lp = torch.log_softmax(ref, -1)
+    deq = torch.load(os.path.join(OUT, "deq_loop_G4.pt"), weights_only=False)[0]
+    for W in (0, 256, 1024):
+        WIN = W
+        hooks.mode, hooks.repl = "replace", deq
+        h = run_seq(model, hooks, ids, cache)
+        with torch.inference_mode():
+            lg = model.lm_head(h[-96:].cuda()).float()
+            lq = torch.log_softmax(lg, -1)
+            kl = (lp.exp() * (lp - lq)).sum(-1).mean().item()
+            top1 = (ref.argmax(-1) == lg.argmax(-1)).float().mean().item()
+        print(f"loop_G4 + 最近 {W:<5} KL {kl:.4f} | 首选一致 {top1 * 100:.2f}% | "
+              f"整卡 {guard.peak / 1e9:.2f} GB", flush=True)
+        del h
+        guard.check()
+    guard.close()
+
+
 if __name__ == "__main__":
     {"capture": phase_capture, "kmeans": phase_kmeans, "kl": phase_kl,
-     "gen": phase_gen}[sys.argv[1]]()
+     "gen": phase_gen, "ref96": phase_ref96, "win96": phase_win96}[sys.argv[1]]()
