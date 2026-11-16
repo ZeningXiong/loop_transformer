@@ -479,10 +479,11 @@ def _fixed_kv_layer_class():
         another, so one scratch is enough) and that view is returned to the attention.
         """
 
-        def __init__(self, max_len, n_heads, head_dim, dtype, device, scratch=None):
+        def __init__(self, max_len, n_heads, head_dim, dtype, device, scratch=None, recent=0):
             super().__init__()
             self.max_len = max_len
             self.int8 = scratch is not None
+            self.recent = int(recent) if (scratch is not None and recent) else 0
             shape = (1, n_heads, max_len, head_dim)
             if self.int8:
                 self.k_q = torch.zeros(shape, dtype=torch.int8, device=device)
@@ -490,6 +491,10 @@ def _fixed_kv_layer_class():
                 self.k_s = torch.zeros((1, n_heads, max_len, 1), dtype=torch.float32, device=device)
                 self.v_s = torch.zeros_like(self.k_s)
                 self.scratch = scratch  # (k_bf16, v_bf16), each [1, n_heads, max_len, head_dim]
+                if self.recent:
+                    wshape = (1, n_heads, self.recent, head_dim)
+                    self.win_k = torch.zeros(wshape, dtype=dtype, device=device)
+                    self.win_v = torch.zeros_like(self.win_k)
             else:
                 self.keys_buf = torch.zeros(shape, dtype=dtype, device=device)
                 self.values_buf = torch.zeros_like(self.keys_buf)
@@ -522,7 +527,44 @@ def _fixed_kv_layer_class():
             a, b = self.cur, self.cur + t
             if b > self.max_len:
                 raise ContextFull(f"上下文已满：{self.cur} + {t} > 上限 {self.max_len} token")
-            if self.int8:
+            if self.int8 and self.recent:
+                W = self.recent
+                cold = max(0, b - W)                      # [0, cold) 走 int8，[cold, b) 走 bf16 窗口
+                # 1) 之前留在窗口里、这次离开窗口的位置：从环里取出后量化
+                ring_lo = max(0, a - W)
+                if cold > ring_lo:
+                    idx = torch.arange(ring_lo, cold, device=self.device) % W
+                    src_k = self.win_k.index_select(2, idx)
+                    src_v = self.win_v.index_select(2, idx)
+                    kq, ks = self._quant(src_k)
+                    vq, vs = self._quant(src_v)
+                    self.k_q[:, :, ring_lo:cold].copy_(kq)
+                    self.k_s[:, :, ring_lo:cold].copy_(ks)
+                    self.v_q[:, :, ring_lo:cold].copy_(vq)
+                    self.v_s[:, :, ring_lo:cold].copy_(vs)
+                # 2) 新 token：落在窗口外的直接量化，落在窗口内的写进环
+                new_cold = max(a, cold)
+                if new_cold > a:
+                    kq, ks = self._quant(key_states[:, :, :new_cold - a])
+                    vq, vs = self._quant(value_states[:, :, :new_cold - a])
+                    self.k_q[:, :, a:new_cold].copy_(kq)
+                    self.k_s[:, :, a:new_cold].copy_(ks)
+                    self.v_q[:, :, a:new_cold].copy_(vq)
+                    self.v_s[:, :, a:new_cold].copy_(vs)
+                if b > new_cold:
+                    idx = torch.arange(new_cold, b, device=self.device) % W
+                    self.win_k.index_copy_(2, idx, key_states[:, :, new_cold - a:].contiguous())
+                    self.win_v.index_copy_(2, idx, value_states[:, :, new_cold - a:].contiguous())
+                # 3) 反量化：冷段走 int8，窗口段拷 bf16
+                kb, vb = self.scratch
+                if cold:
+                    torch.mul(self.k_q[:, :, :cold], self.k_s[:, :, :cold], out=kb[:, :, :cold])
+                    torch.mul(self.v_q[:, :, :cold], self.v_s[:, :, :cold], out=vb[:, :, :cold])
+                if b > cold:
+                    idx = torch.arange(cold, b, device=self.device) % W
+                    kb[:, :, cold:b].copy_(self.win_k.index_select(2, idx))
+                    vb[:, :, cold:b].copy_(self.win_v.index_select(2, idx))
+            elif self.int8:
                 kq, ks = self._quant(key_states)
                 vq, vs = self._quant(value_states)
                 self.k_q[:, :, a:b].copy_(kq)
@@ -562,11 +604,11 @@ def _plan_pairs(model):
                 seen[pi] = ei
 
 
-def make_fixed_cache(model, max_len, device="cuda:0", kv_int8=False, share_k=False):
+def make_fixed_cache(model, max_len, device="cuda:0", kv_int8=False, share_k=False, recent=0):
     """A loop-model DynamicCache whose 14 full-attention slots are FixedKVLayer(max_len) (bf16 or int8).
 
     share_k=True: 两遍循环共用一份 K 平面（第二遍原地覆盖第一遍写的区间），V 仍按遍独立。
-    相当于 Dory “只留末轮”的一半——省 K 那一半，V 不共享。int8 与 bf16 都支持。
+    recent=W: 最近 W 个 token 的 K/V 保持 bf16（只有更早的位置走 int8），像 LoopVQ 的 serving 配方。
     """
     from transformers.cache_utils import DynamicCache, DynamicLayer
 
@@ -582,7 +624,7 @@ def make_fixed_cache(model, max_len, device="cuda:0", kv_int8=False, share_k=Fal
     for i, layer in enumerate(cache.layers):
         if type(layer) is DynamicLayer:
             cache.layers[i] = FixedKVLayer(max_len, tc.num_key_value_heads, tc.head_dim, torch.bfloat16, device,
-                                           scratch=scratch)
+                                           scratch=scratch, recent=recent)
             n += 1
     assert n == 14, n
     if share_k:
