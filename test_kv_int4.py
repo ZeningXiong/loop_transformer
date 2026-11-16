@@ -19,7 +19,7 @@ from sn_loop_common import VramGuard, load, make_fixed_cache  # noqa: E402
 from sn_spec import MTPHead, generate_speculative  # noqa: E402
 
 P2 = int(sys.argv[1]) if len(sys.argv) > 1 else 8
-N_CTX, N_SPEC = 16384, 24
+N_CTX, N_SPEC = 16384, 64
 dev = "cuda"
 tok, model = load("offline", int8=[])
 mtp = MTPHead(model)
@@ -42,6 +42,12 @@ guard = VramGuard()
 cache = make_fixed_cache(model, N_CTX + 64, kv_int8=True, pass2_bits=P2)
 print(f"第2遍 {P2}-bit | KV {cache._fixed_bytes / 2**20:.1f} MB", flush=True)
 with torch.inference_mode():
+    # 预热：先跑几次 1/2-token 前向（写满缓存、触发内核 autotune），再开始计时
+    for k in (1, 2, 1, 2, 2):
+        toks_w = torch.randint(1000, 20000, (1, k), device=dev)
+        model.model(input_ids=toks_w, position_ids=torch.tensor([[N_CTX]], device=dev),
+                    past_key_values=cache, use_cache=True)
+    torch.cuda.synchronize()
     toks, st = generate_speculative(model, mtp, ids, N_SPEC, cache, chunk_size=256)
 tps = st["tokens"] / st["decode_s"]
 print(f"prefill {st['prefill_s']:.1f}s | 投机 {tps:.2f} tok/s（命中 {st['accepted']}/{st['steps']}）"
