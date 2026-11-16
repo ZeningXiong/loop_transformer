@@ -23,6 +23,7 @@ OUT = r"D:\models\_loopvq_tmp"
 os.makedirs(OUT, exist_ok=True)
 CHUNK, MAXLEN, SINK = 512, 16384, 8
 WIN, TOTAL = 0, 0  # 最近 WIN 个 token 保持精确（0 = 全部量化）
+SEL = (0, 1)       # 哪些循环遍的格子被量化（逐格分配用）
 KCODE = 256  # 8-bit codes, as in the paper
 GS = (4, 8, 16, 32)  # 2, 1, 0.5, 0.25 bits per element
 KL_CFGS = ["int8", "int4", "loop_G4", "chan_G4", "loop_G8", "chan_G8", "loop_G16", "chan_G16"]
@@ -67,7 +68,7 @@ class Hooks:
             if self.mode == "capture":
                 x = out.detach().reshape(out.shape[0], out.shape[1], 4, -1)[0]  # [T, H, D]
                 self.store.setdefault((layer, p, kv), []).append(x.to("cpu", torch.bfloat16))
-            elif self.mode == "replace" and self.visits[layer] == 2:
+            elif self.mode == "replace" and self.visits[layer] == 2 and p in SEL:
                 s, e = self.span
                 lo = max(0, SINK - s)  # keep sink tokens exact
                 hi = e - s if WIN <= 0 else max(0, min(e, TOTAL - WIN) - s)  # [hi, ) 留精确
@@ -379,6 +380,43 @@ def phase_win96():
     guard.close()
 
 
+def phase_alloc96():
+    """逐格分配的第一问：第 1 遍 vs 第 2 遍，哪一边的 KV 压到 2-bit 更便宜。"""
+    global SEL, WIN
+    tok, model, guard, cache = load_model()
+    hooks = Hooks(model)
+    ids = _long_ids(tok)
+    WIN = 0
+    ref = torch.load(os.path.join(OUT, "ref96.pt"), weights_only=True).cuda().float()
+    lp = torch.log_softmax(ref, -1)
+    deq = torch.load(os.path.join(OUT, "deq_loop_G4.pt"), weights_only=False)[0]
+    hooks.mode, hooks.repl = "replace", deq
+    d8 = torch.load(os.path.join(OUT, "deq_int8.pt"), weights_only=False)[0]
+    d4 = torch.load(os.path.join(OUT, "deq_int4.pt"), weights_only=False)[0]
+    for label, repl, sel in (
+            ("部署方案：第1遍 int8 + 第2遍 int4",
+             {k: v for k, v in d8.items() if k[1] == 0} | {k: v for k, v in d4.items() if k[1] == 1},
+             (0, 1)),
+            ("对照：全部 int8", d8, (0, 1)),
+            ("只压第 2 遍 int4", d4, (1,)),
+            ("只压第 2 遍 2bit", torch.load(os.path.join(OUT, "deq_loop_G4.pt"),
+                                          weights_only=False)[0], (1,))):
+        SEL = sel
+        hooks.repl = repl
+        h = run_seq(model, hooks, ids, cache)
+        with torch.inference_mode():
+            lg = model.lm_head(h[-96:].cuda()).float()
+            lq = torch.log_softmax(lg, -1)
+            kl = (lp.exp() * (lp - lq)).sum(-1).mean().item()
+            top1 = (ref.argmax(-1) == lg.argmax(-1)).float().mean().item()
+        print(f"{label:<20} KL {kl:.4f} | 首选一致 {top1 * 100:.2f}% | 整卡 {guard.peak / 1e9:.2f} GB",
+              flush=True)
+        del h
+        guard.check()
+    guard.close()
+
+
 if __name__ == "__main__":
     {"capture": phase_capture, "kmeans": phase_kmeans, "kl": phase_kl,
-     "gen": phase_gen, "ref96": phase_ref96, "win96": phase_win96}[sys.argv[1]]()
+     "gen": phase_gen, "ref96": phase_ref96, "win96": phase_win96,
+     "alloc96": phase_alloc96}[sys.argv[1]]()
