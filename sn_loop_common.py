@@ -479,17 +479,25 @@ def _fixed_kv_layer_class():
         another, so one scratch is enough) and that view is returned to the attention.
         """
 
-        def __init__(self, max_len, n_heads, head_dim, dtype, device, scratch=None, recent=0):
+        def __init__(self, max_len, n_heads, head_dim, dtype, device, scratch=None, recent=0, bits=8):
             super().__init__()
             self.max_len = max_len
             self.int8 = scratch is not None
             self.recent = int(recent) if (scratch is not None and recent) else 0
+            self.bits = int(bits) if self.int8 else 8
+            head_dim = head_dim
             shape = (1, n_heads, max_len, head_dim)
             if self.int8:
-                self.k_q = torch.zeros(shape, dtype=torch.int8, device=device)
-                self.v_q = torch.zeros_like(self.k_q)
+                if self.bits == 4:
+                    shape = (1, n_heads, max_len, head_dim // 2)
+                    self.k_q = torch.zeros(shape, dtype=torch.uint8, device=device)
+                    self.v_q = torch.zeros_like(self.k_q)
+                else:
+                    self.k_q = torch.zeros(shape, dtype=torch.int8, device=device)
+                    self.v_q = torch.zeros_like(self.k_q)
                 self.k_s = torch.zeros((1, n_heads, max_len, 1), dtype=torch.float32, device=device)
                 self.v_s = torch.zeros_like(self.k_s)
+                self.head_dim = head_dim
                 self.scratch = scratch  # (k_bf16, v_bf16), each [1, n_heads, max_len, head_dim]
                 if self.recent:
                     wshape = (1, n_heads, self.recent, head_dim)
@@ -522,12 +530,39 @@ def _fixed_kv_layer_class():
             s = x.float().abs().amax(-1, keepdim=True).clamp_min(1e-8) / 127.0
             return torch.round(x.float() / s).clamp_(-127, 127).to(torch.int8), s
 
+        @staticmethod
+        def _quant4(x):
+            """[1,H,T,D] -> packed [1,H,T,D/2] uint8（每字节两个 4-bit，偏移二进制）+ scale。"""
+            s = x.float().abs().amax(-1, keepdim=True).clamp_min(1e-8) / 7.0
+            q = torch.round(x.float() / s).clamp_(-7, 7).to(torch.int16)
+            q = q.view(1, x.shape[1], x.shape[2], x.shape[3] // 2, 2)
+            packed = ((q[..., 0] + 8) * 16 + (q[..., 1] + 8)).to(torch.uint8)
+            return packed, s
+
+        @staticmethod
+        def _dequant4(packed, s, out_view):
+            hi = (packed >> 4).to(torch.int16) - 8
+            lo = (packed & 0xF).to(torch.int16) - 8
+            v = torch.stack([hi, lo], dim=-1)
+            v = v.reshape(packed.shape[0], packed.shape[1], packed.shape[2], packed.shape[3] * 2)
+            torch.mul(v.float(), s, out=out_view)
+
         def update(self, key_states, value_states, *args, **kwargs):
             t = key_states.shape[-2]
             a, b = self.cur, self.cur + t
             if b > self.max_len:
                 raise ContextFull(f"上下文已满：{self.cur} + {t} > 上限 {self.max_len} token")
-            if self.int8 and self.recent:
+            if self.int8 and self.bits == 4:
+                kq, ks = self._quant4(key_states)
+                vq, vs = self._quant4(value_states)
+                self.k_q[:, :, a:b].copy_(kq)
+                self.k_s[:, :, a:b].copy_(ks)
+                self.v_q[:, :, a:b].copy_(vq)
+                self.v_s[:, :, a:b].copy_(vs)
+                kb, vb = self.scratch
+                self._dequant4(self.k_q[:, :, :b], self.k_s[:, :, :b], kb[:, :, :b])
+                self._dequant4(self.v_q[:, :, :b], self.v_s[:, :, :b], vb[:, :, :b])
+            elif self.int8 and self.recent:
                 W = self.recent
                 cold = max(0, b - W)                      # [0, cold) 走 int8，[cold, b) 走 bf16 窗口
                 # 1) 之前留在窗口里、这次离开窗口的位置：从环里取出后量化
@@ -604,11 +639,13 @@ def _plan_pairs(model):
                 seen[pi] = ei
 
 
-def make_fixed_cache(model, max_len, device="cuda:0", kv_int8=False, share_k=False, recent=0):
+def make_fixed_cache(model, max_len, device="cuda:0", kv_int8=False, share_k=False, recent=0,
+                     pass2_bits=8):
     """A loop-model DynamicCache whose 14 full-attention slots are FixedKVLayer(max_len) (bf16 or int8).
 
     share_k=True: 两遍循环共用一份 K 平面（第二遍原地覆盖第一遍写的区间），V 仍按遍独立。
     recent=W: 最近 W 个 token 的 K/V 保持 bf16（只有更早的位置走 int8），像 LoopVQ 的 serving 配方。
+    pass2_bits=4: 循环段的第二遍执行槽用 4-bit 打包（8 就是现在的 int8）。
     """
     from transformers.cache_utils import DynamicCache, DynamicLayer
 
@@ -620,11 +657,13 @@ def make_fixed_cache(model, max_len, device="cuda:0", kv_int8=False, share_k=Fal
     shape = (1, tc.num_key_value_heads, max_len, tc.head_dim)
     scratch = (torch.zeros(shape, dtype=torch.bfloat16, device=device),
                torch.zeros(shape, dtype=torch.bfloat16, device=device)) if kv_int8 else None
+    second = {e2 for _pi, e1, e2 in _plan_pairs(model)}
     n = 0
     for i, layer in enumerate(cache.layers):
         if type(layer) is DynamicLayer:
+            bits = pass2_bits if (pass2_bits != 8 and i in second) else 8
             cache.layers[i] = FixedKVLayer(max_len, tc.num_key_value_heads, tc.head_dim, torch.bfloat16, device,
-                                           scratch=scratch, recent=recent)
+                                           scratch=scratch, recent=recent, bits=bits)
             n += 1
     assert n == 14, n
     if share_k:
