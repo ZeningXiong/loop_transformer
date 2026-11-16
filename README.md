@@ -1,4 +1,4 @@
-# SenseNova-Loop-9B 在 8 GB 笔记本显卡上的推理优化
+﻿# SenseNova-Loop-9B 在 8 GB 笔记本显卡上的推理优化
 
 在 **RTX 4070 Laptop（8 GB 显存 / 32 GB 内存）** 上跑 **SenseNova-Loop-9B-Preview**（9.4B 参数，24 层循环两次 = 每 token 56 次层执行）。
 
@@ -48,6 +48,8 @@ profile_spec_step.py   投机一步的五段分解（快照/草稿/验证/重算
 profile_mtp_feed.py    MTP 回填的子算子级拆分
 
 check_fixed_kv.py      固定 KV + 折叠 GQA 的正确性
+check_loopvq.py        LoopVQ（沿 loop 轴联合量化）的 16K 可行性验证（算子 + KL）
+bench_loopvq_deq.py    2-bit 码本反量化的算子耗时（16K，对比 int8）
 check_kv_int8.py       int8 KV 相对 bf16 KV 的精度
 check_no_pass2.py      砍掉第二遍循环会怎样（KL 2.28 → 方向关闭）
 test_loop4_8k.py       推理时改循环次数（2 遍 vs 4 遍）
