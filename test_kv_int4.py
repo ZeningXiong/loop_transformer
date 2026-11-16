@@ -1,4 +1,4 @@
-"""端到端：第 2 遍槽位用 int4（其余 int8），16K 下的显存与投机速度。
+﻿"""端到端：第 2 遍槽位用 int4（其余 int8），16K 下的显存与投机速度。
 
 一个进程只跑一个配置（避免两个 KV 缓存同时驻留）：
   python test_kv_int4.py 8   # 全部 int8
@@ -45,6 +45,6 @@ with torch.inference_mode():
     toks, st = generate_speculative(model, mtp, ids, N_SPEC, cache, chunk_size=256)
 tps = st["tokens"] / st["decode_s"]
 print(f"prefill {st['prefill_s']:.1f}s | 投机 {tps:.2f} tok/s（命中 {st['accepted']}/{st['steps']}）"
-      f" | 每步 {st['decode_s'] / st['steps'] * 1e3:.0f} ms | 整卡峰值 {guard.peak / 1e9:.2f} GB",
+      f" | 每步 {st['decode_s'] / st['steps'] * 1e3:.0f} ms | 本进程峰值 {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | 整卡 {guard.peak / 1e9:.2f} GB",
       flush=True)
 guard.close()

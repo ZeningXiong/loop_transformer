@@ -560,8 +560,9 @@ def _fixed_kv_layer_class():
                 self.v_q[:, :, a:b].copy_(vq)
                 self.v_s[:, :, a:b].copy_(vs)
                 kb, vb = self.scratch
-                self._dequant4(self.k_q[:, :, :b], self.k_s[:, :, :b], kb[:, :, :b])
-                self._dequant4(self.v_q[:, :, :b], self.v_s[:, :, :b], vb[:, :, :b])
+                from int4_dequant import dequant4  # 融合解包：不经临时张量，逐位一致
+                dequant4(self.k_q[:, :, :b], self.k_s[:, :, :b], kb[:, :, :b])
+                dequant4(self.v_q[:, :, :b], self.v_s[:, :, :b], vb[:, :, :b])
             elif self.int8 and self.recent:
                 W = self.recent
                 cold = max(0, b - W)                      # [0, cold) 走 int8，[cold, b) 走 bf16 窗口
