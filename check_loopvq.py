@@ -1,4 +1,4 @@
-"""Low-cost feasibility test of LoopVQ (arXiv 2611.05304) on SenseNova-Loop-9B.
+﻿"""Low-cost feasibility test of LoopVQ (arXiv 2611.05304) on SenseNova-Loop-9B.
 
 Question: does coding the two loop passes of a full-attention layer jointly ("loop" grouping: G/2 channels x 2
 passes per 8-bit code) beat coding each pass alone ("channel" grouping: G channels x 1 pass) at the same bitwidth?
@@ -288,5 +288,46 @@ def phase_kl():
     guard.close()
 
 
+def phase_gen():
+    """16K 提示词上的生成对比：exact KV vs loop_G4（2-bit）。新 token 的 KV 两边都是精确的，
+    所以这里隔离的是"提示词侧 KV 被压到 2-bit"对生成内容的影响。"""
+    tok, model, guard, cache = load_model()
+    hooks = Hooks(model)
+    ids = tokenize(tok, "_lq_held.jsonl")[0]
+    n_gen = 24
+    out = {}
+    lps = {}
+    for tag in ("exact", "int8", "loop_G4"):
+        hooks.mode = "replace" if tag != "exact" else None
+        if tag != "exact":
+            hooks.repl = torch.load(os.path.join(OUT, f"deq_{tag}.pt"), weights_only=False)[0]
+        h = run_seq(model, hooks, ids, cache)
+        hooks.mode = None
+        with torch.inference_mode():
+            lg = model.lm_head(h[-1:].cuda()).float()
+            toks, lps[tag] = [], []
+            for i in range(n_gen):
+                lps[tag].append(torch.log_softmax(lg[0, -1], -1))
+                nxt = lg[0, -1].argmax().view(1, 1)
+                toks.append(int(nxt))
+                pos = torch.tensor([[ids.shape[1] + i]], device="cuda")
+                o = model.model(input_ids=nxt, position_ids=pos, past_key_values=cache, use_cache=True)
+                lg = model.lm_head(o.last_hidden_state).float()
+        out[tag] = dict(tokens=toks, text=tok.decode(toks, skip_special_tokens=True))
+        guard.check()
+        print(f"\n[{tag}] 生成 {n_gen} token：{out[tag]['text'][:300]!r}", flush=True)
+    same = next((i for i, (a, b) in enumerate(zip(out["exact"]["tokens"], out["loop_G4"]["tokens"]))
+                 if a != b), n_gen)
+    kl = [(a.exp() * (a - b)).sum().item() for a, b in zip(lps["exact"], lps["loop_G4"])]
+    print(f"\n[生成对比] 一致前缀 {same}/{n_gen} 个 token；"
+          f"KL 均值 {sum(kl[:max(same, 1)]) / max(same, 1):.4f}，最大 {max(kl):.4f}")
+    json.dump({"n_gen": n_gen, "same": same, "kl": kl,
+               "exact": out["exact"]["text"], "loop_G4": out["loop_G4"]["text"]},
+              open(os.path.join(OUT, "gen.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    print(f"整卡峰值 {guard.peak / 1e9:.2f} GB", flush=True)
+    guard.close()
+
+
 if __name__ == "__main__":
-    {"capture": phase_capture, "kmeans": phase_kmeans, "kl": phase_kl}[sys.argv[1]]()
+    {"capture": phase_capture, "kmeans": phase_kmeans, "kl": phase_kl,
+     "gen": phase_gen}[sys.argv[1]]()
