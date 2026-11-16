@@ -22,22 +22,44 @@
 ## 目录
 
 ```
-sn_loop_common.py      加载器：离线 NF4 权重、固定 KV 缓冲、KV int8、分块 prefill、显存保护、Sinkhorn 补丁
+sn_loop_common.py      加载器：离线 NF4 权重、固定 KV 缓冲、KV int8（可 K 共享）、分块 prefill、显存保护、Sinkhorn 补丁
 sn_spec.py             MTP 自投机解码（2-token 验证、快照回滚、自适应降级）
-cudagraph_decode.py    CUDA Graph 解码（1 token）
-cudagraph_spec.py      2-token 验证的 Graph 版本
 fast_sinkhorn.py       2×2 Sinkhorn 闭式解（默认启用，省 23%/步）
 fused_rmsnorm.py       Triton 融合 RMSNorm（逐位一致，单算子 ×1.23）
-int8_gemv.py / nf4_gemv*.py   自写的 4-bit / int8 GEMV 内核
-convert_nf4.py / convert_int8.py   把原始 FP32 检查点转成离线量化格式
-mixed_search.py        按层混合精度搜索（产出 mixed_plan_*.json）
+int8_gemv.py           int8 权重的单 token GEMV
+cudagraph_decode.py    1-token CUDA Graph 解码（可选，只在短上下文划算）
+cudagraph_spec.py      2-token 验证的 Graph 版本
+
+convert_nf4.py         原始 FP32 → 离线 NF4（一次性）
+convert_int8.py        按层 int8 权重转换（给混合精度用）
+mixed_search.py        按层混合精度搜索，产出 mixed_plan_*.json
+download_sensenova_loop.py / prepare_eval_texts.py   取权重、生成评测文本
 
 diag_sensenova_loop.py 评测入口（数学题 / 开放问题，--think 开思考）
 eval_nf4_vs_bf16.py    与 bf16 参考的逐位置 KL 对比
-bench_spec16k.py / test_spec_k.py   投机解码测速（16K）
-test_loop4_8k.py       推理时改循环次数（验证"训练时属性"）
-profile_*.py           分段计时（组 / kernel / 投机单步 / MTP 回填）
-test_*.py check_*.py   各阶段的验证脚本（能复现每一步结论）
+test_sinkhorn_quality.py / test_sinkhorn_quality_think.py   闭式解 vs 20 轮迭代的任务级对比
+
+speed_now.py           当前配置的实测速度（16K，普通 vs 2-token）
+test_spec_k.py         2 / 3 / 4 / 6 token 验证对比
+bench_spec16k.py       16K 投机解码基准（最早的 9.68 tok/s 就是它）
+test_mtp_nf4.py        MTP 头量化成 NF4 的显存/命中率/速度
+probe_16k_phases.py    16K 一步的分段计时（单 token / 2-token / 整步）
+profile_spec_step.py   投机一步的五段分解（快照/草稿/验证/重算/回填）
+profile_mtp_feed.py    MTP 回填的子算子级拆分
+
+check_fixed_kv.py      固定 KV + 折叠 GQA 的正确性
+check_kv_int8.py       int8 KV 相对 bf16 KV 的精度
+check_no_pass2.py      砍掉第二遍循环会怎样（KL 2.28 → 方向关闭）
+test_loop4_8k.py       推理时改循环次数（2 遍 vs 4 遍）
+bench_mhc_ablation.py  mHC 路由的耗时分解（sinkhorn 占 25.2 ms）
+probe_graph_replay.py  CUDA Graph 重放 vs eager 前向
+measure_near_miss.py   失配时草稿离正确 token 有多近（近似接受可行性）
+test_clock_ramp.py     冷启动 vs 预热的单步耗时 + GPU 频率
+test_guard_overhead.py VramGuard 对速度的影响
+test_fast_sinkhorn*.py 闭式解的数值验证与收敛性
+test_fused_rmsnorm.py / debug_rmsnorm_model.py / test_fused_rmsnorm_e2e.py   RMSNorm 融合的逐位验证
+
+plot_mtp_hitrate.py / make_chart.py   生成 assets/ 里的两张图
 
 docs/Optimize.md       完整优化记录：每个提升的细节 + 失败尝试的一句话结论
 assets/                结果图（MTP 逐位命中率、CUDA Graph 对比）

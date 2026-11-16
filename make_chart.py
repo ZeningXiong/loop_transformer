@@ -1,4 +1,4 @@
-﻿"""Chart for the CUDA-graph decode experiment: cudagraph_bench.json + cudagraph_batch.json."""
+"""Chart for the CUDA-graph decode experiment: cudagraph_bench.json + cudagraph_batch.json."""
 import json
 import os
 import sys

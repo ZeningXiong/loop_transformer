@@ -1,4 +1,4 @@
-﻿"""验证融合 RMSNorm：先逐位比对，再测单算子与整步耗时。"""
+"""验证融合 RMSNorm：先逐位比对，再测单算子与整步耗时。"""
 import json
 import os
 import statistics

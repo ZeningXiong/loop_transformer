@@ -549,8 +549,25 @@ def _fixed_kv_layer_class():
     return FixedKVLayer
 
 
-def make_fixed_cache(model, max_len, device="cuda:0", kv_int8=False):
-    """A loop-model DynamicCache whose 14 full-attention slots are FixedKVLayer(max_len) (bf16 or int8)."""
+def _plan_pairs(model):
+    """(物理层, 第一遍执行槽, 第二遍执行槽)：只对出现两次的全注意力层。"""
+    lm = model.model.language_model
+    types = model.config.text_config.layer_types
+    seen = {}
+    for ei, pi in enumerate(lm._loop_plan):
+        if types[pi] == "full_attention":
+            if pi in seen:
+                yield pi, seen[pi], ei
+            else:
+                seen[pi] = ei
+
+
+def make_fixed_cache(model, max_len, device="cuda:0", kv_int8=False, share_k=False):
+    """A loop-model DynamicCache whose 14 full-attention slots are FixedKVLayer(max_len) (bf16 or int8).
+
+    share_k=True: 两遍循环共用一份 K 平面（第二遍原地覆盖第一遍写的区间），V 仍按遍独立。
+    相当于 Dory “只留末轮”的一半——省 K 那一半，V 不共享。int8 与 bf16 都支持。
+    """
     from transformers.cache_utils import DynamicCache, DynamicLayer
 
     FixedKVLayer = _fixed_kv_layer_class()
@@ -568,7 +585,24 @@ def make_fixed_cache(model, max_len, device="cuda:0", kv_int8=False):
                                            scratch=scratch)
             n += 1
     assert n == 14, n
-    cache._fixed_bytes = sum(l.storage_bytes() for l in cache.layers if isinstance(l, FixedKVLayer))
+    if share_k:
+        for _pi, e1, e2 in _plan_pairs(model):
+            a, b = cache.layers[e1], cache.layers[e2]
+            if a.int8:
+                b.k_q, b.k_s = a.k_q, a.k_s
+            else:
+                b.keys_buf = a.keys_buf
+                b._set_views()
+    seen, total = set(), 0
+    for layer in cache.layers:
+        if isinstance(layer, FixedKVLayer):
+            bufs = ((layer.k_q, layer.k_s, layer.v_q, layer.v_s) if layer.int8
+                    else (layer.keys_buf, layer.values_buf))
+            for t in bufs:
+                if id(t) not in seen:
+                    seen.add(id(t))
+                    total += t.numel() * t.element_size()
+    cache._fixed_bytes = total
     cache._scratch_bytes = sum(t.numel() * t.element_size() for t in scratch) if scratch else 0
     cache._scratch = scratch
     return cache
