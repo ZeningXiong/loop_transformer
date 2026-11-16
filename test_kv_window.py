@@ -21,6 +21,7 @@ dev = "cuda"
 N_CTX, CHUNK, TAIL = 16384, 256, 96
 REF = os.path.join(HERE, "_kv_ref.pt")
 phase = sys.argv[1] if len(sys.argv) > 1 else "cmp"
+only = int(sys.argv[2]) if len(sys.argv) > 2 else -1
 
 tok, model = load("offline", int8=[])
 texts = [json.loads(l)["text"] for l in open(os.path.join(HERE, "eval_texts_heldout.jsonl"),
@@ -60,7 +61,10 @@ with torch.inference_mode():
     else:
         ref = torch.load(REF, weights_only=True).to(dev).float()
         lp = torch.log_softmax(ref, -1)
-        for label, recent in (("int8（现状）", 0), ("int8 + 最近 256", 256), ("int8 + 最近 1024", 1024)):
+        pairs = ([("single", only)] if only >= 0 else
+                 [("int8（现状）", 0), ("延迟编码 N=8", 8),
+                  ("延迟编码 N=32", 32), ("延迟编码 N=128", 128)])
+        for label, recent in pairs:
             cur, t = run(recent, True)
             lq = torch.log_softmax(cur, -1)
             kl = (lp.exp() * (lp - lq)).sum(-1).mean().item()
