@@ -1,4 +1,4 @@
-"""端到端：第 2 遍槽位用 int4（其余 int8），16K 下的显存与投机速度。
+﻿"""端到端：第 2 遍槽位用 int4（其余 int8），16K 下的显存与投机速度。
 
 一个进程只跑一个配置（避免两个 KV 缓存同时驻留）：
   python test_kv_int4.py 8   # 全部 int8
@@ -38,6 +38,7 @@ for name, child in list(mtp.named_modules()):
                                        quant_type="nf4", compress_statistics=False,
                                        quant_storage=torch.uint8)
         setattr(parent, attr, new.to(dev))
+torch.cuda.empty_cache()  # 把量化 MTP 后留下的分配器碎片还给驱动
 texts = [json.loads(l)["text"] for l in open(os.path.join(HERE, "eval_texts_heldout.jsonl"),
                                              encoding="utf-8")]
 ids = tok("".join(texts * 60), add_special_tokens=False, return_tensors="pt").input_ids[:, :N_CTX].cuda()
