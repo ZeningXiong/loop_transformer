@@ -1,4 +1,4 @@
-﻿"""端到端：第 2 遍槽位用 int4（其余 int8），16K 下的显存与投机速度。
+"""端到端：第 2 遍槽位用 int4（其余 int8），16K 下的显存与投机速度。
 
 一个进程只跑一个配置（避免两个 KV 缓存同时驻留）：
   python test_kv_int4.py 8   # 全部 int8
@@ -19,9 +19,12 @@ from sn_loop_common import VramGuard, load, make_fixed_cache  # noqa: E402
 from sn_spec import MTPHead, generate_speculative  # noqa: E402
 
 P2 = int(sys.argv[1]) if len(sys.argv) > 1 else 8
-N_CTX, N_SPEC = 16384, 64
+N_CTX = int(sys.argv[2]) if len(sys.argv) > 2 else 16384
+N_SPEC = 64
 dev = "cuda"
-tok, model = load("offline", int8=[])
+plan = (json.load(open(os.path.join(HERE, "mixed_plan_1.0.json"), encoding="utf-8"))["int8"]
+        if os.environ.get("PLAN_INT8") == "1" else [])
+tok, model = load("offline", int8=plan)
 mtp = MTPHead(model)
 mtp.new_cache(N_CTX + 64)
 for name, child in list(mtp.named_modules()):
