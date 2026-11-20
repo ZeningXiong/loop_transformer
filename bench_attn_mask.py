@@ -15,7 +15,9 @@ L, Hq, Hkv, D, Tq = 16464, 16, 4, 256, 2
 q = torch.randn(1, Hq, Tq, D, device=dev, dtype=torch.bfloat16)
 k = torch.randn(1, Hkv, L, D, device=dev, dtype=torch.bfloat16)
 v = torch.randn(1, Hkv, L, D, device=dev, dtype=torch.bfloat16)
-mask = torch.ones(1, 1, Tq, L, dtype=torch.bool, device=dev)
+mask = torch.zeros(1, 1, Tq, L, dtype=torch.bool, device=dev)
+mask[0, 0, 0, :L - 1] = True
+mask[0, 0, 1, :] = True
 
 
 def bench(fn, n=20, warm=5):
