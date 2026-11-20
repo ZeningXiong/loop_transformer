@@ -229,6 +229,9 @@ def load_offline(fix_regex=False, compile_sinkhorn=True, device="cuda:0", int8=(
     gc.collect()  # drop replaced layers (Params4bit <-> Linear4bit cycles) and loader leftovers
     torch.cuda.empty_cache()
     use_memory_efficient_attention()
+    # 用折叠 GQA 取代 HF 的 sdpa 路径：后者每层对 K/V 做 repeat_kv（16K 下 2×134 MB 拷贝，
+    # 单层 2.5 ms、14 层约 35 ms/步）。折叠版把 g 个 query 头拼到序列轴，不再复制 K/V。
+    use_gqa_fold_attention(True)
     if compile_sinkhorn:
         patch_sinkhorn(model)
     import fast_sinkhorn  # 2x2 Sinkhorn 的闭式解：一步 decode 省约 23%，任务级答案不变
