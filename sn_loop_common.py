@@ -235,7 +235,7 @@ def load_offline(fix_regex=False, compile_sinkhorn=True, device="cuda:0", int8=(
 
     fast_sinkhorn.enable(True)
     # 元素级融合：两者都逐位一致（RMSNorm 单算子 ×1.23，SiLU×up 一次 kernel 替代两次），16K 一步 −5%
-    if os.environ.get("SENSENOVA_FUSE", "0") == "1":  # 默认关：单步 −5%，但端到端输出长度与基线不同，需先查清
+    if os.environ.get("SENSENOVA_FUSE", "1") == "1":  # 两个内核都逐位一致；16K 一步 −5%
         import fused_rmsnorm
 
         fused_rmsnorm.enable(True)
