@@ -6,7 +6,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # 原始 FP32 检查点；可用环境变量 SENSENOVA_MODEL 覆盖
-MODEL = os.environ.get("SENSENOVA_MODEL", r"D:\models\SenseNova-Loop-9B-Preview")
+MODEL = os.environ.get("SENSENOVA_MODEL", r"E:\models\SenseNova-Loop-9B-Preview")
 
 NF4_DEVICE_MAP = {
     "model.language_model.embed_tokens": "cpu",  # 248320 x 4096 bf16 ~2 GB stays in RAM
@@ -94,7 +94,7 @@ def patch_sinkhorn(model):
 # ---------------------------------------------------------------------------------------------
 # Offline NF4 checkpoint (made by convert_nf4.py) + embedding rows read from SSD per token
 # ---------------------------------------------------------------------------------------------
-NF4_DIR = os.environ.get("SENSENOVA_NF4", r"D:\models\SenseNova-Loop-9B-Preview-nf4")
+NF4_DIR = os.environ.get("SENSENOVA_NF4", r"E:\models\SenseNova-Loop-9B-Preview-nf4")
 
 
 class SsdEmbedding(torch.nn.Module):
