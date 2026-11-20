@@ -41,7 +41,7 @@ warnings.filterwarnings("ignore", message=".*incorrect regex pattern.*")
 warnings.filterwarnings("ignore", message=".*Token indices sequence length.*")
 
 from sn_loop_common import VramGuard, load, make_fixed_cache, reset_cache  # noqa: E402
-from sn_spec import MTPHead, _Snapshot, get_tap  # noqa: E402
+from sn_spec import MTPHead, _Snapshot, generate_speculative, get_tap  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--ctx", type=int, default=16384, help="上下文上限（token）")
@@ -115,6 +115,21 @@ def generate(ids):
         if len(full) > shown:
             print(full[shown:], end="", flush=True)
             shown = len(full)
+
+    if args.spec:
+        # 投机走生产实现（已验证与贪心逐 token 一致），代价是不能流式显示
+        def _reset():
+            reset_cache(cache)
+            mtp.cache.reset()
+
+        _reset()
+        ids_out, st = generate_speculative(model, mtp, ids, args.max_new, cache, chunk_size=256)
+        text = tok.decode(ids_out)
+        print(text, flush=True)
+        dt = st["prefill_s"] + st["decode_s"]
+        print(f"\n\033[90m[{len(ids_out)} token / {dt:.1f}s = {len(ids_out) / max(st['decode_s'], 1e-6):.2f} tok/s"
+              f"，投机 {st['accepted']}/{st['steps']}，整卡 {guard.peak / 1e9:.2f} GB]\033[0m", flush=True)
+        return text
 
     t0 = time.perf_counter()
     while n_out < args.max_new:
