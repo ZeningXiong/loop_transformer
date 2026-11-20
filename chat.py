@@ -54,6 +54,7 @@ ap.add_argument("--max-new", type=int, default=256, help="每轮最多生成多�
 ap.add_argument("--think", action="store_true", help="打开思考模式")
 ap.add_argument("--spec", action="store_true", help="启用 2-token 投机（更快，但当前实现的输出与贪心不一致，慎用）")
 ap.add_argument("--int4", type=int, default=4, help="第 2 遍 KV 的位数（4 或 8）")
+ap.add_argument("--graph", action="store_true", help="实验：CUDA graph 解码（仅 ≥256 token 上下文正确，短对话会乱）")
 ap.add_argument("--q", type=str, default=None, help="直接回答这一句然后退出（非交互）")
 args = ap.parse_args()
 
@@ -78,6 +79,14 @@ torch.cuda.empty_cache()
 cache = make_fixed_cache(model, args.ctx + 64, kv_int8=True, pass2_bits=args.int4)
 snap = _Snapshot(cache)
 
+dec = None
+if args.graph:
+    from cudagraph_spec import Graph2Decoder
+
+    dec = Graph2Decoder(model, args.ctx + 64, kv_int8=True, qlen=2, pass2_bits=args.int4)
+    cache = dec.cache
+    snap = dec._snap()
+
 
 guard = VramGuard()
 eos_ids = model.generation_config.eos_token_id
@@ -101,6 +110,97 @@ def prefill(ids):
         prev_h = h[:, -1:]
     return prev_h
 
+
+
+@torch.inference_mode()
+def _draft(hidden, token, pos):
+    e = mtp.pre_fc_norm_embedding(mtp.tm.embed_tokens(token))
+    h = mtp.pre_fc_norm_hidden(hidden)
+    z = mtp.fc(torch.cat([e, h] if mtp.embed_first else [h, e], dim=-1))
+    pe = mtp.tm.rotary_emb(z, torch.tensor([[pos]], device=dev)[None].expand(3, -1, -1))
+    z = mtp.layer(z, position_embeddings=pe, attention_mask=None,
+                  position_ids=torch.tensor([[pos]], device=dev),
+                  past_key_values=mtp.cache, use_cache=True)
+    return mtp.lm_head(mtp.norm(z))[0, -1]
+
+
+@torch.inference_mode()
+def _feed(hidden, token, pos):
+    e = mtp.pre_fc_norm_embedding(mtp.tm.embed_tokens(token))
+    h = mtp.pre_fc_norm_hidden(hidden)
+    z = mtp.fc(torch.cat([e, h] if mtp.embed_first else [h, e], dim=-1))
+    pe = mtp.tm.rotary_emb(z, torch.tensor([[pos]], device=dev)[None].expand(3, -1, -1))
+    mtp.layer(z, position_embeddings=pe, attention_mask=None,
+              position_ids=torch.tensor([[pos]], device=dev),
+              past_key_values=mtp.cache, use_cache=True)
+
+
+@torch.inference_mode()
+def generate_graph(ids):
+    """与 test_graph_prod 中验证过 token 一致的循环：每步固定提交 2 token。"""
+    T = ids.shape[1]
+    if T < 256:
+        print("\n[警告] 图路径在 <256 token 上下文下不正确，请去掉 --graph", flush=True)
+    dec.reset()
+    mtp.cache.reset()
+    prev_h = None
+    for s in range(0, T, 256):
+        e = min(s + 256, T)
+        h = model.model(input_ids=ids[:, s:e], position_ids=torch.arange(s, e, device=dev)[None],
+                        past_key_values=dec.cache, use_cache=True).last_hidden_state
+        if prev_h is not None:
+            mtp(prev_h, ids[:, s:s + 1], torch.tensor([[s]], device=dev), logits=False)
+        if e - s > 1:
+            mtp(h[:, :-1], ids[:, s + 1:e], torch.arange(s + 1, e, device=dev)[None], logits=False)
+        prev_h = h[:, -1:]
+    x = model.lm_head(prev_h).float()[0, -1].argmax().view(1, 1)
+    h_last = prev_h
+    out_toks, steps, acc = [], 0, 0
+    acc_ids, shown = [], 0
+
+    def emit(tokens):
+        nonlocal shown
+        acc_ids.extend(tokens)
+        full = tok.decode(acc_ids)
+        if len(full) > shown:
+            print(full[shown:], end="", flush=True)
+            shown = len(full)
+
+    t0 = time.perf_counter()
+    while len(out_toks) < args.max_new:
+        snap.save()
+        base = mtp.cache.layer.cur
+        d = _draft(h_last, x, T + steps * 2).argmax().view(1, 1)
+        L = dec.step(torch.cat([x, d], 1), T + steps * 2)
+        H = dec.bufs[dec.bucket_for(T + steps * 2 + 2)]["out"].clone()
+        p0 = L[0, 0].argmax().view(1, 1)
+        if d.item() == p0.item():
+            acc += 1
+            commit, nxt, h0, h1 = [x, d], L[0, 1].argmax().view(1, 1), H[:, 0:1], H[:, 1:2]
+        else:
+            snap.restore()
+            L2 = dec.step(torch.cat([x, p0], 1), T + steps * 2)
+            H2 = dec.bufs[dec.bucket_for(T + steps * 2 + 2)]["out"].clone()
+            commit, nxt, h0, h1 = [x, p0], L2[0, 1].argmax().view(1, 1), H2[:, 0:1], H2[:, 1:2]
+        dec.advance(2)
+        steps += 1
+        out_toks.extend([commit[0].item(), commit[1].item()])
+        if commit[0].item() in eos or commit[1].item() in eos:
+            emit([t for t in (commit[0].item(), commit[1].item()) if t not in eos])
+            break
+        emit([commit[0].item(), commit[1].item()])
+        mtp.cache.layer.cur = base
+        mtp.cache.layer._set_views()
+        _feed(h_last, commit[0], T + (steps - 1) * 2)
+        _feed(h0, commit[1], T + (steps - 1) * 2 + 1)
+        x, h_last = nxt, h1
+        guard.check()
+    torch.cuda.synchronize()
+    dt = time.perf_counter() - t0
+    n = len(out_toks)
+    print(f"\n\033[90m[{n} token / {dt:.1f}s = {n / dt:.2f} tok/s，图，投机 {acc}/{steps}，"
+          f"整卡 {guard.peak / 1e9:.2f} GB]\033[0m", flush=True)
+    return tok.decode(acc_ids)
 
 
 @torch.inference_mode()
@@ -204,7 +304,7 @@ if args.q:
     msgs = [{"role": "user", "content": args.q}]
     ids = build(msgs)
     print("模型 > ", end="", flush=True)
-    generate(ids)
+    (generate_graph if dec is not None else generate)(ids)
     guard.close()
     sys.exit(0)
 print(f"上下文上限 {args.ctx}，第 2 遍 KV {args.int4}-bit，思考模式 {'开' if think else '关'}。输入 /quit 退出。\n",
@@ -241,7 +341,7 @@ while True:
     reset_cache(cache)
     mtp.cache.reset()
     print("\033[1m模型\033[0m > ", end="", flush=True)
-    answer = generate(ids)
+    answer = (generate_graph if dec is not None else generate)(ids)
     messages.append({"role": "assistant", "content": answer})
     print()
 
