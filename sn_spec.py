@@ -12,6 +12,7 @@ Greedy speculation with one draft token per step:
 Every committed token is the main model's own greedy choice, so the text matches plain greedy decoding
 up to floating-point differences between the 1-token and 2-token compute paths.
 """
+import os
 import time
 
 import torch
@@ -20,7 +21,8 @@ from transformers.models.qwen3_5 import modeling_qwen3_5 as hf
 
 from sn_loop_common import _fixed_kv_layer_class, reset_cache
 
-MTP_FILE = r"D:\models\SenseNova-Loop-9B-Preview\mtp.safetensors"
+_MODEL_DIR = os.environ.get("SENSENOVA_MODEL") or r"D:\models\SenseNova-Loop-9B-Preview"
+MTP_FILE = os.environ.get("SENSENOVA_MTP") or os.path.join(_MODEL_DIR, "mtp.safetensors")
 
 
 class _MiniCache:

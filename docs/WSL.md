@@ -53,6 +53,24 @@ printf 'net.ipv6.conf.all.disable_ipv6=1\n' > /etc/sysctl.d/99-disable-ipv6.conf
 **注意：pip 本身仍比 curl 慢一个数量级**（~1.4 MB/s vs 30 MB/s）。如果急需，可以先用
 `curl -C -` 把大 wheel 拉到本地再 `pip install /path/to.whl --no-deps`。
 
+## 装完之后的实测：WSL 并不比 Windows 快
+
+同一份模型、同一个脚本（`probe_16k_phases.py`）、同一时刻各跑一次：
+
+| 指标 | Windows | WSL2 Ubuntu |
+|---|---:|---:|
+| 1-token 前向 | **170.6 ms** | 173.6 ms |
+| 2-token 前向 | **170.5 ms** | 177.0 ms |
+| 2-token 自投机 | **10.23 tok/s（196 ms/步）** | 9.62 tok/s（208 ms/步） |
+| 命中 | 12/12 | 12/12 |
+| GPU | 2460 MHz / 81–98% | 2460 MHz / 93–96% |
+
+**结论：WSL 慢 2–6%**，而不是快 10%。16K 的一步由 GPU 工作主导（4-bit GEMV + 56 次层执行 + 16K 注意力），
+跨操作系统的调度开销占比本来就小；WSL2 还有 9p 文件系统与 syscall 的额外开销。
+
+所以"换 Linux 能拿回 10%"的假设被否掉了。要拿回那部分，得做**变长 CUDA graph + 融合内核**，
+而不是换操作系统。
+
 ## 复现这条测试需要的东西
 
 - WSL2 + Ubuntu 24.04、Python 3.12、`python3-venv`；
