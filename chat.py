@@ -40,6 +40,11 @@ warnings.filterwarnings("ignore", message=".*causal_conv1d.*")
 warnings.filterwarnings("ignore", message=".*incorrect regex pattern.*")
 warnings.filterwarnings("ignore", message=".*Token indices sequence length.*")
 
+# transformers 用 logging 而不是 warnings 打回退提示，单独压掉
+from transformers.utils import logging as _hf_log  # noqa: E402
+
+_hf_log.set_verbosity_error()
+
 from sn_loop_common import VramGuard, load, make_fixed_cache, reset_cache  # noqa: E402
 from sn_spec import MTPHead, _Snapshot, generate_speculative, get_tap  # noqa: E402
 
