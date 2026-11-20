@@ -17,12 +17,28 @@ import os
 import sys
 import time
 
+# 用的不是项目 venv 的解释器时，自动切过去（venv 里才有 torch/bitsandbytes）
+if os.name == "nt":
+    _venv = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "Scripts", "python.exe")
+    if os.path.exists(_venv) and os.path.abspath(sys.executable).lower() != os.path.abspath(_venv).lower():
+        import subprocess
+
+        sys.exit(subprocess.call([_venv, os.path.abspath(__file__), *sys.argv[1:]]))
+
 import bitsandbytes as bnb
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.stdout.reconfigure(encoding="utf-8")
+
+import warnings  # noqa: E402
+
+warnings.filterwarnings("ignore", message=".*seq_len.*num_heads.*")
+warnings.filterwarnings("ignore", message=".*Triton version.*")
+warnings.filterwarnings("ignore", message=".*causal_conv1d.*")
+warnings.filterwarnings("ignore", message=".*incorrect regex pattern.*")
+warnings.filterwarnings("ignore", message=".*Token indices sequence length.*")
 
 from sn_loop_common import VramGuard, load, make_fixed_cache, reset_cache  # noqa: E402
 from sn_spec import MTPHead, _Snapshot, get_tap  # noqa: E402
