@@ -69,6 +69,20 @@ def feed(hidden, token, pos):
 
 
 @torch.inference_mode()
+def feed2(h_prev, h0, t0, t1, pos0):
+    """一次处理两个 token 的 MTP 回填（原来要调用两次）。"""
+    hidden = torch.cat([h_prev, h0], dim=1)
+    tokens = torch.cat([t0, t1], dim=1)
+    pos = torch.arange(pos0, pos0 + 2, device=dev)[None]
+    e = mtp.pre_fc_norm_embedding(mtp.tm.embed_tokens(tokens))
+    h = mtp.pre_fc_norm_hidden(hidden)
+    x = mtp.fc(torch.cat([e, h] if mtp.embed_first else [h, e], dim=-1))
+    pe = mtp.tm.rotary_emb(x, pos[None].expand(3, -1, -1))
+    mtp.layer(x, position_embeddings=pe, attention_mask=None, position_ids=pos,
+              past_key_values=mtp.cache, use_cache=True)
+
+
+@torch.inference_mode()
 def run_graph():
     dec = Graph2Decoder(model, N_CTX + 80, kv_int8=True, qlen=2, pass2_bits=4)
     dec.reset()
@@ -93,13 +107,17 @@ def run_graph():
     x = lg[0, -1].argmax().view(1, 1)
     out_toks, steps, acc = [], 0, 0
     snap = dec._snap()
+    seg = dict(snap=0.0, draft=0.0, step=0.0, head=0.0, feed=0.0)
     td = time.perf_counter()
     while len(out_toks) < N_GEN:
+        t0 = time.perf_counter()
         snap.save()
         base = mtp.cache.layer.cur
+        t1 = time.perf_counter()
         dlg, _ = draft(h_last, x, N_CTX)          # MTP 草稿（位置只影响 rotary，用当前绝对位置）
         d = dlg.argmax().view(1, 1)
         toks2 = torch.cat([x, d], 1)
+        t2 = time.perf_counter()
         L = dec.step(toks2, N_CTX + steps * 2)
         H = dec.bufs[dec.bucket_for(N_CTX + steps * 2 + 2)]["out"].clone()
         p0 = L[0, 0].argmax().view(1, 1)
@@ -111,20 +129,27 @@ def run_graph():
             L2 = dec.step(torch.cat([x, p0], 1), N_CTX + steps * 2)
             H2 = dec.bufs[dec.bucket_for(N_CTX + steps * 2 + 2)]["out"].clone()
             commit, nxt, hidden0, hidden1 = [x, p0], L2[0, 1].argmax().view(1, 1), H2[:, 0:1], H2[:, 1:2]
+        t3 = time.perf_counter()
         dec.advance(2)
         out_toks.extend(t.item() for t in commit)
         steps += 1
         # 保持 MTP 缓存同步：喂 (隐藏, token) 两对
         mtp.cache.layer.cur = base
         mtp.cache.layer._set_views()
-        feed(h_last, commit[0], N_CTX + (steps - 1) * 2)
-        feed(hidden0, commit[1], N_CTX + (steps - 1) * 2 + 1)
+        feed2(h_last, hidden0, commit[0], commit[1], N_CTX + (steps - 1) * 2)
         x, h_last = nxt, hidden1
+        t4 = time.perf_counter()
         guard.check()
+        seg["snap"] += t1 - t0
+        seg["draft"] += t2 - t1
+        seg["step"] += t3 - t2
+        seg["feed"] += t4 - t3
     torch.cuda.synchronize()
     dec_s = time.perf_counter() - td
     cap_s = sum(dec.capture_s.values())
     steady = (dec_s - cap_s) / max(steps, 1) * 1e3
+    print("  分段（ms/步）：" + "  ".join(f"{k} {v / max(steps, 1) * 1e3:.1f}" for k, v in seg.items()),
+          flush=True)
     del dec
     torch.cuda.empty_cache()
     return out_toks[:N_GEN], dict(prefill_s=pre, decode_s=dec_s, steps=steps, acc=acc,
