@@ -97,6 +97,11 @@ class Graph2Decoder:
         self.model = model
         self.tm = model.model.language_model
         self.emb = self.tm.embed_tokens
+        # 图路径必须用"尊重显式掩码"的折叠注意力：全局的 gqa_fold_attention 会忽略传进来的 mask，
+        # 让重放读到未写过的槽位（实测会悄悄改坏输出），这里把它换回来。
+        from cudagraph_decode import use_masked_attention
+
+        use_masked_attention(True)
         self.hidden = model.config.text_config.hidden_size
         self.qlen = qlen
         self.device = device
