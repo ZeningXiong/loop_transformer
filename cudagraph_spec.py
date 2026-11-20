@@ -23,8 +23,8 @@ from cudagraph_decode import GraphKVLayer, make_graph_cache  # noqa: E402
 class GraphKV2Layer(GraphKVLayer):
     """Same slot, but a verify step writes qlen entries at once."""
 
-    def __init__(self, max_len, n_heads, head_dim, dtype, device, idx, scratch=None, qlen=2):
-        super().__init__(max_len, n_heads, head_dim, dtype, device, idx, scratch=scratch)
+    def __init__(self, max_len, n_heads, head_dim, dtype, device, idx, scratch=None, qlen=2, bits=8):
+        super().__init__(max_len, n_heads, head_dim, dtype, device, idx, scratch=scratch, bits=bits)
         self.qlen = qlen
         self.idx2 = torch.zeros(qlen, dtype=torch.long, device=device)
 
@@ -37,16 +37,22 @@ class GraphKV2Layer(GraphKVLayer):
             raise RuntimeError(f"上下文已满：{self.cur} + {t} > {self.max_len}")
         ix = self.idx2
         if self.int8:
-            kq, ks = self._quant(key_states)
-            vq, vs = self._quant(value_states)
+            q4 = self.bits == 4
+            kq, ks = (self._quant4 if q4 else self._quant)(key_states)
+            vq, vs = (self._quant4 if q4 else self._quant)(value_states)
             self.k_q.index_copy_(2, ix, kq)
             self.k_s.index_copy_(2, ix, ks)
             self.v_q.index_copy_(2, ix, vq)
             self.v_s.index_copy_(2, ix, vs)
             n = self.pad if self.pad is not None else b
             kb, vb = self.scratch
-            torch.mul(self.k_q[:, :, :n], self.k_s[:, :, :n], out=kb[:, :, :n])
-            torch.mul(self.v_q[:, :, :n], self.v_s[:, :, :n], out=vb[:, :, :n])
+            if q4:
+                from int4_dequant import dequant4
+                dequant4(self.k_q[:, :, :n], self.k_s[:, :, :n], kb[:, :, :n])
+                dequant4(self.v_q[:, :, :n], self.v_s[:, :, :n], vb[:, :, :n])
+            else:
+                torch.mul(self.k_q[:, :, :n], self.k_s[:, :, :n], out=kb[:, :, :n])
+                torch.mul(self.v_q[:, :, :n], self.v_s[:, :, :n], out=vb[:, :, :n])
         else:
             self.keys_buf.index_copy_(2, ix, key_states)
             self.values_buf.index_copy_(2, ix, value_states)
@@ -55,7 +61,7 @@ class GraphKV2Layer(GraphKVLayer):
         return self.keys, self.values
 
 
-def make_graph_cache2(model, max_len, device="cuda:0", kv_int8=False, qlen=2):
+def make_graph_cache2(model, max_len, device="cuda:0", kv_int8=False, qlen=2, pass2_bits=8):
     from transformers.cache_utils import DynamicCache, DynamicLayer
 
     tm = model.model.language_model
@@ -66,11 +72,14 @@ def make_graph_cache2(model, max_len, device="cuda:0", kv_int8=False, qlen=2):
     shape = (1, tc.num_key_value_heads, max_len, tc.head_dim)
     scratch = (torch.zeros(shape, dtype=torch.bfloat16, device=device),
                torch.zeros(shape, dtype=torch.bfloat16, device=device)) if kv_int8 else None
+    from sn_loop_common import _plan_pairs
+    second = {e2 for _pi, e1, e2 in _plan_pairs(model)}
     n_full = 0
     for i, layer in enumerate(cache.layers):
         if type(layer) is DynamicLayer:
+            bits = pass2_bits if (pass2_bits != 8 and i in second) else 8
             cache.layers[i] = GraphKV2Layer(max_len, tc.num_key_value_heads, tc.head_dim,
-                                            torch.bfloat16, device, idx, scratch=scratch, qlen=qlen)
+                                            torch.bfloat16, device, idx, scratch=scratch, qlen=qlen, bits=bits)
             n_full += 1
     assert n_full == 14, n_full
     cache.idx = idx
@@ -81,7 +90,8 @@ def make_graph_cache2(model, max_len, device="cuda:0", kv_int8=False, qlen=2):
 class Graph2Decoder:
     """Captures one graph per bucket for a fixed query length `qlen`."""
 
-    def __init__(self, model, max_len, device="cuda:0", kv_int8=False, qlen=2, buckets=(256, 512, 1024,
+    def __init__(self, model, max_len, device="cuda:0", kv_int8=False, qlen=2, pass2_bits=8,
+                 buckets=(256, 512, 1024,
                                                                                        2048, 4096, 8192,
                                                                                        16384, 32768)):
         self.model = model
@@ -90,7 +100,7 @@ class Graph2Decoder:
         self.hidden = model.config.text_config.hidden_size
         self.qlen = qlen
         self.device = device
-        self.cache = make_graph_cache2(model, max_len, device, kv_int8, qlen)
+        self.cache = make_graph_cache2(model, max_len, device, kv_int8, qlen, pass2_bits)
         self.max_len = max_len
         # 桶不能超过 KV 缓冲区长度；把 max_len 本身也当一个桶，避免为 16K 分配 32K
         self.buckets = sorted({b for b in buckets if b < max_len} | {max_len})

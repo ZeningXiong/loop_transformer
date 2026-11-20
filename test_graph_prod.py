@@ -70,7 +70,7 @@ def feed(hidden, token, pos):
 
 @torch.inference_mode()
 def run_graph():
-    dec = Graph2Decoder(model, N_CTX + 80, kv_int8=True, qlen=2)
+    dec = Graph2Decoder(model, N_CTX + 80, kv_int8=True, qlen=2, pass2_bits=4)
     dec.reset()
     mtp.cache.reset()
     prev_h = None
@@ -133,7 +133,7 @@ def run_graph():
 
 @torch.inference_mode()
 def run_eager():
-    cache = make_fixed_cache(model, N_CTX + 80, kv_int8=True)
+    cache = make_fixed_cache(model, N_CTX + 80, kv_int8=True, pass2_bits=4)
     toks, st = generate_speculative(model, mtp, ids, N_GEN, cache, chunk_size=256)
     del cache
     torch.cuda.empty_cache()

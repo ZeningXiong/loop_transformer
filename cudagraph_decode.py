@@ -30,16 +30,21 @@ class ContextFull(RuntimeError):
 class GraphKVLayer(DynamicLayer):
     """Fixed-size KV slot with a graph-friendly write path (see module docstring)."""
 
-    def __init__(self, max_len, n_heads, head_dim, dtype, device, idx, scratch=None):
+    def __init__(self, max_len, n_heads, head_dim, dtype, device, idx, scratch=None, bits=8):
         super().__init__()
         self.max_len = max_len
         self.int8 = scratch is not None
-        self.shape = (1, n_heads, max_len, head_dim)
+        self.bits = int(bits) if self.int8 else 8
+        self.head_dim = head_dim
+        self.shape = (1, n_heads, max_len, head_dim if self.bits == 8 else head_dim // 2)
         self.device = device
         self.idx = idx                                  # shared [1] long buffer, filled per step
         self.pad = None                                 # None -> attention sees :cur (prefill)
         if self.int8:
-            self.k_q = torch.zeros(self.shape, dtype=torch.int8, device=device)
+            if self.bits == 4:
+                self.k_q = torch.zeros(self.shape, dtype=torch.uint8, device=device)
+            else:
+                self.k_q = torch.zeros(self.shape, dtype=torch.int8, device=device)
             self.v_q = torch.zeros_like(self.k_q)
             self.k_s = torch.zeros((1, n_heads, max_len, 1), dtype=torch.float32, device=device)
             self.v_s = torch.zeros_like(self.k_s)
@@ -84,48 +89,58 @@ class GraphKVLayer(DynamicLayer):
         s = x.float().abs().amax(-1, keepdim=True).clamp_min(1e-8) / 127.0
         return torch.round(x.float() / s).clamp_(-127, 127).to(torch.int8), s
 
+    @staticmethod
+    def _quant4(x):
+        s = x.float().abs().amax(-1, keepdim=True).clamp_min(1e-8) / 7.0
+        q = torch.round(x.float() / s).clamp_(-7, 7).to(torch.int16)
+        q = q.view(1, x.shape[1], x.shape[2], x.shape[3] // 2, 2)
+        return ((q[..., 0] + 8) * 16 + (q[..., 1] + 8)).to(torch.uint8), s
+
     # -- write -----------------------------------------------------------------------------------
     def update(self, key_states, value_states, *args, **kwargs):
         t = key_states.shape[-2]
         a, b = self.cur, self.cur + t
         if b > self.max_len:
             raise ContextFull(f"上下文已满：{self.cur} + {t} > {self.max_len}")
-        if t == 1:                                      # decode: capturable, position from the buffer
-            if self.int8:
-                kq, ks = self._quant(key_states)
-                vq, vs = self._quant(value_states)
+        q4 = self.int8 and self.bits == 4
+        if self.int8:
+            kq, ks = (self._quant4 if q4 else self._quant)(key_states)
+            vq, vs = (self._quant4 if q4 else self._quant)(value_states)
+            if t == 1:                                  # decode: capturable, position from the buffer
                 self.k_q.index_copy_(2, self.idx, kq)
                 self.k_s.index_copy_(2, self.idx, ks)
                 self.v_q.index_copy_(2, self.idx, vq)
                 self.v_s.index_copy_(2, self.idx, vs)
                 n = self.pad if self.pad is not None else b
-                kb, vb = self.scratch
-                torch.mul(self.k_q[:, :, :n], self.k_s[:, :, :n], out=kb[:, :, :n])
-                torch.mul(self.v_q[:, :, :n], self.v_s[:, :, :n], out=vb[:, :, :n])
-            else:
-                self.keys_buf.index_copy_(2, self.idx, key_states)
-                self.values_buf.index_copy_(2, self.idx, value_states)
-        else:                                           # prefill: plain slice writes
-            if self.int8:
-                kq, ks = self._quant(key_states)
-                vq, vs = self._quant(value_states)
+            else:                                       # prefill: plain slice writes
                 self.k_q[:, :, a:b].copy_(kq)
                 self.k_s[:, :, a:b].copy_(ks)
                 self.v_q[:, :, a:b].copy_(vq)
                 self.v_s[:, :, a:b].copy_(vs)
-                kb, vb = self.scratch
-                torch.mul(self.k_q[:, :, :b], self.k_s[:, :, :b], out=kb[:, :, :b])
-                torch.mul(self.v_q[:, :, :b], self.v_s[:, :, :b], out=vb[:, :, :b])
+                n = b
+            kb, vb = self.scratch
+            if q4:
+                from int4_dequant import dequant4
+                dequant4(self.k_q[:, :, :n], self.k_s[:, :, :n], kb[:, :, :n])
+                dequant4(self.v_q[:, :, :n], self.v_s[:, :, :n], vb[:, :, :n])
             else:
-                self.keys_buf[:, :, a:b].copy_(key_states)
-                self.values_buf[:, :, a:b].copy_(value_states)
+                torch.mul(self.k_q[:, :, :n], self.k_s[:, :, :n], out=kb[:, :, :n])
+                torch.mul(self.v_q[:, :, :n], self.v_s[:, :, :n], out=vb[:, :, :n])
+        elif t == 1:
+            self.keys_buf.index_copy_(2, self.idx, key_states)
+            self.values_buf.index_copy_(2, self.idx, value_states)
+        else:
+            self.keys_buf[:, :, a:b].copy_(key_states)
+            self.values_buf[:, :, a:b].copy_(value_states)
         self.cur = b
         self._set_views()
         return self.keys, self.values
 
 
-def make_graph_cache(model, max_len, device="cuda:0", kv_int8=False):
+def make_graph_cache(model, max_len, device="cuda:0", kv_int8=False, pass2_bits=8):
     """Mirror of sn_loop_common.make_fixed_cache, with graph-friendly slots."""
+    from sn_loop_common import _plan_pairs
+
     tm = model.model.language_model
     tc = model.config.text_config
     cache = DynamicCache(config=tm._loop_cache_config)
@@ -134,11 +149,13 @@ def make_graph_cache(model, max_len, device="cuda:0", kv_int8=False):
     shape = (1, tc.num_key_value_heads, max_len, tc.head_dim)
     scratch = (torch.zeros(shape, dtype=torch.bfloat16, device=device),
                torch.zeros(shape, dtype=torch.bfloat16, device=device)) if kv_int8 else None
+    second = {e2 for _pi, e1, e2 in _plan_pairs(model)}
     n_full = 0
     for i, layer in enumerate(cache.layers):
         if type(layer) is DynamicLayer:                 # full attention: replace
+            bits = pass2_bits if (pass2_bits != 8 and i in second) else 8
             cache.layers[i] = GraphKVLayer(max_len, tc.num_key_value_heads, tc.head_dim,
-                                           torch.bfloat16, device, idx, scratch=scratch)
+                                           torch.bfloat16, device, idx, scratch=scratch, bits=bits)
             n_full += 1
     assert n_full == 14, n_full
     cache.idx = idx
