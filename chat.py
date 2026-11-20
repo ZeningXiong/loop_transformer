@@ -47,7 +47,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--ctx", type=int, default=16384, help="上下文上限（token）")
 ap.add_argument("--max-new", type=int, default=256, help="每轮最多生成多少 token")
 ap.add_argument("--think", action="store_true", help="打开思考模式")
-ap.add_argument("--plain", action="store_true", help="关闭投机，纯贪心解码")
+ap.add_argument("--spec", action="store_true", help="启用 2-token 投机（更快，但当前实现的输出与贪心不一致，慎用）")
 ap.add_argument("--int4", type=int, default=4, help="第 2 遍 KV 的位数（4 或 8）")
 ap.add_argument("--q", type=str, default=None, help="直接回答这一句然后退出（非交互）")
 args = ap.parse_args()
@@ -72,7 +72,8 @@ torch.cuda.empty_cache()
 
 cache = make_fixed_cache(model, args.ctx + 64, kv_int8=True, pass2_bits=args.int4)
 snap = _Snapshot(cache)
-tap = get_tap(model)
+
+
 guard = VramGuard()
 eos_ids = model.generation_config.eos_token_id
 eos = set(eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids])
@@ -96,27 +97,36 @@ def prefill(ids):
     return prev_h
 
 
+
 @torch.inference_mode()
 def generate(ids):
+    """贪心 / 2-token 投机解码。逐 token 攒起来再整体解码——按 token 对分别 decode 会吃掉跨 token 的多字节字符。"""
     T = ids.shape[1]
     h_last = prefill(ids)
     logits = model.lm_head(h_last).float()
     x = logits[0, -1].argmax().view(1, 1)
-    pos, out, steps, acc = T, [], 0, 0
-    pieces = []
+    pos, n_out, steps, acc = T, 0, 0, 0
+    acc_ids, shown = [], 0
+
+    def emit(tokens):
+        nonlocal shown
+        acc_ids.extend(tokens)
+        full = tok.decode(acc_ids)
+        if len(full) > shown:
+            print(full[shown:], end="", flush=True)
+            shown = len(full)
+
     t0 = time.perf_counter()
-    while len(out) < args.max_new:
-        if args.plain:
+    while n_out < args.max_new:
+        if (not args.spec):
             mtp(h_last, x, torch.tensor([[pos]], device=dev), logits=False)
             h = model.model(input_ids=x, position_ids=torch.tensor([[pos]], device=dev),
                             past_key_values=cache, use_cache=True).last_hidden_state
             lg = model.lm_head(h).float()
-            out.append(x.item())
-            piece = "" if x.item() in eos else tok.decode([x.item()])
-            pieces.append(piece)
-            print(piece, end="", flush=True)
+            n_out += 1
             if x.item() in eos:
                 break
+            emit([x.item()])
             x, h_last, pos = lg[0, -1].argmax().view(1, 1), h[:, -1:], pos + 1
             continue
         draft = mtp(h_last, x, torch.tensor([[pos]], device=dev))[0, -1].argmax().view(1, 1)
@@ -137,23 +147,20 @@ def generate(ids):
                             past_key_values=cache, use_cache=True).last_hidden_state
             lg = model.lm_head(h).float()
             t2, h_use, y_next = y1, h, lg[0, 1].argmax().view(1, 1)
-        out.extend([x.item(), t2.item()])
-        keep = [t for t in (x.item(), t2.item()) if t not in eos]
-        piece = tok.decode(keep) if keep else ""
-        pieces.append(piece)
-        print(piece, end="", flush=True)
+        n_out += 2
         if x.item() in eos or t2.item() in eos:
             break
+        emit([x.item(), t2.item()])
         mtp(h_use[:, :1], t2, torch.tensor([[pos + 1]], device=dev), logits=False)
         x, h_last, pos = y_next, h_use[:, 1:2], pos + 2
         guard.check()
     torch.cuda.synchronize()
     dt = time.perf_counter() - t0
     rate = acc / max(steps, 1) * 100
-    tag = "" if args.plain else f"，投机 {acc}/{steps} = {rate:.0f}%"
-    print(f"\n\033[90m[{len(out)} token / {dt:.1f}s = {len(out) / dt:.2f} tok/s{tag}，整卡 {guard.peak / 1e9:.2f} GB]\033[0m",
-          flush=True)
-    return "".join(pieces)
+    tag = "" if (not args.spec) else f"，投机 {acc}/{steps} = {rate:.0f}%"
+    print(f"\n\033[90m[{len(acc_ids)} token / {dt:.1f}s = {len(acc_ids) / dt:.2f} tok/s{tag}"
+          f"，整卡 {guard.peak / 1e9:.2f} GB]\033[0m", flush=True)
+    return tok.decode(acc_ids)
 
 
 def build(messages):
