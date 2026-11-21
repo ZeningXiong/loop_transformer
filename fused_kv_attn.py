@@ -64,8 +64,11 @@ def _split_kernel(q_ptr, kq_ptr, ks_ptr, vq_ptr, vs_ptr, acc_ptr, m_ptr, l_ptr, 
             vis = valid[None, :] & (offs[None, :] <= lim[:, None])
         s = tl.where(vis, s, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(s, 1))
-        p = tl.exp(s - m_new[:, None])
-        alpha = tl.exp(m_i - m_new)
+        # 整块都被掩码时 m_new 仍是 -inf：此时 exp(-inf - -inf) = NaN 会污染累加，
+        # 必须显式跳过（图路径下 pad 远大于 cur 时，后面的 split 全是这种情况）
+        finite = m_new > -float("inf")
+        alpha = tl.where(finite, tl.exp(m_i - m_new), 1.0)
+        p = tl.where(finite[:, None] & vis, tl.exp(s - m_new[:, None]), 0.0)
         l_i = l_i * alpha + tl.sum(p, 1)
         acc = acc * alpha[:, None]
 
