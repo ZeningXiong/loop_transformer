@@ -87,6 +87,12 @@ def run_graph():
     import sn_loop_common as _slc
 
     _slc.use_fused_kv_attention(os.environ.get("SENSENOVA_FUSED") == "1")
+    mg = None
+    if os.environ.get("SENSENOVA_MTP_GRAPH") == "1":
+        from mtp_graph import MTPGraph
+
+        mg = MTPGraph(mtp, N_CTX + 80)
+        mg.open_prefill()
     dec = Graph2Decoder(model, N_CTX + 80, kv_int8=True, qlen=2, pass2_bits=4)
     dec.reset()
     mtp.cache.reset()
@@ -105,6 +111,8 @@ def run_graph():
     torch.cuda.synchronize()
     pre = time.perf_counter() - t0
 
+    if mg is not None:
+        mg.capture(N_CTX)
     h_last = prev_h
     lg = model.lm_head(h_last).float()
     x = lg[0, -1].argmax().view(1, 1)
@@ -117,8 +125,11 @@ def run_graph():
         snap.save()
         base = mtp.cache.layer.cur
         t1 = time.perf_counter()
-        dlg, _ = draft(h_last, x, N_CTX)          # MTP 草稿（位置只影响 rotary，用当前绝对位置）
-        d = dlg.argmax().view(1, 1)
+        if mg is not None:
+            d = mg.draft(h_last, x, N_CTX + steps * 2).view(1, 1)
+        else:
+            dlg, _ = draft(h_last, x, N_CTX)
+            d = dlg.argmax().view(1, 1)
         toks2 = torch.cat([x, d], 1)
         t2 = time.perf_counter()
         L = dec.step(toks2, N_CTX + steps * 2)
