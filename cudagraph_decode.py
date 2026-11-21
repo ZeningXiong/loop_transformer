@@ -170,6 +170,18 @@ def masked_fold_attention(module, query, key, value, attention_mask, dropout=0.0
                           is_causal=None, **kwargs):
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
+    from sn_loop_common import QuantKV
+
+    if isinstance(key, QuantKV):
+        from fused_kv_attn import attend
+
+        B, Hq_, Tq_, D_ = query.shape
+        Hkv = key.k_q.shape[1]
+        g = Hq_ // Hkv
+        out = attend(query.reshape(Hkv, g * Tq_, D_), key.k_q, key.k_s, key.v_q, key.v_s,
+                     key.L, key.bits, g, Tq_, mask=attention_mask)
+        return out.reshape(B, Hq_, Tq_, D_).transpose(1, 2).contiguous(), None
+
     B, Hq, Tq, D = query.shape
     Hkv, L = key.shape[1], key.shape[2]
     g = Hq // Hkv

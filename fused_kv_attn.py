@@ -14,10 +14,11 @@ import triton.language as tl
 
 
 @triton.jit
-def _split_kernel(q_ptr, kq_ptr, ks_ptr, vq_ptr, vs_ptr, acc_ptr, m_ptr, l_ptr,
-                  L, n_splits, sh_k, st_k, sh_s, st_s,
+def _split_kernel(q_ptr, kq_ptr, ks_ptr, vq_ptr, vs_ptr, acc_ptr, m_ptr, l_ptr, mask_ptr,
+                  L, n_splits, sh_k, st_k, sh_s, st_s, sh_m, st_m,
                   G: tl.constexpr, TQ: tl.constexpr, D: tl.constexpr, ROWS: tl.constexpr,
-                  BLOCK_L: tl.constexpr, BITS: tl.constexpr, SCALE: tl.constexpr):
+                  BLOCK_L: tl.constexpr, BITS: tl.constexpr, SCALE: tl.constexpr,
+                  HAS_MASK: tl.constexpr):
     pid = tl.program_id(0)
     hv = pid // n_splits
     sp = pid % n_splits
@@ -53,7 +54,14 @@ def _split_kernel(q_ptr, kq_ptr, ks_ptr, vq_ptr, vs_ptr, acc_ptr, m_ptr, l_ptr,
         k = (kq * ks[:, None]).to(tl.bfloat16)
 
         s = tl.dot(q, tl.trans(k)) * SCALE                        # [ROWS, BLOCK_L]
-        vis = valid[None, :] & (offs[None, :] <= lim[:, None])
+        if HAS_MASK:
+            # mask 形状 [Tq, L]：折叠后的第 r 行对应原第 (r % TQ) 行
+            mrow = r % TQ
+            mvals = tl.load(mask_ptr + mrow[:, None] * sh_m + offs[None, :] * st_m,
+                            mask=valid[None, :], other=0)
+            vis = valid[None, :] & mvals
+        else:
+            vis = valid[None, :] & (offs[None, :] <= lim[:, None])
         s = tl.where(vis, s, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(s, 1))
         p = tl.exp(s - m_new[:, None])
@@ -80,7 +88,7 @@ def _split_kernel(q_ptr, kq_ptr, ks_ptr, vq_ptr, vs_ptr, acc_ptr, m_ptr, l_ptr,
     tl.store(l_ptr + ob + r, l_i)
 
 
-def attend(q_folded, k_q, k_s, v_q, v_s, L, bits, g, tq, n_splits=8, block_l=64):
+def attend(q_folded, k_q, k_s, v_q, v_s, L, bits, g, tq, n_splits=8, block_l=64, mask=None):
     """q_folded [Hkv, g*tq, D] bf16 -> out [Hkv, g*tq, D] bf16（直接读量化 KV）。
 
     k_q/v_q: [1, Hkv, max_len, D or D/2]；k_s/v_s: [1, Hkv, max_len, 1] fp32。
@@ -93,11 +101,16 @@ def attend(q_folded, k_q, k_s, v_q, v_s, L, bits, g, tq, n_splits=8, block_l=64)
     acc = torch.empty(Hkv * ns, ROWS, D, dtype=torch.float32, device=q_folded.device)
     m = torch.empty(Hkv * ns, ROWS, dtype=torch.float32, device=q_folded.device)
     low = torch.empty(Hkv * ns, ROWS, dtype=torch.float32, device=q_folded.device)
+    if mask is None:
+        mask_arg, sh_m, st_m = qp, 1, 1
+    else:
+        mask_arg = mask if mask.dim() == 2 else mask.reshape(mask.shape[-2], mask.shape[-1])
+        sh_m, st_m = mask_arg.stride(0), mask_arg.stride(1)
     _split_kernel[(Hkv * ns,)](
-        qp, k_q, k_s, v_q, v_s, acc, m, low,
-        L, ns, k_q.stride(1), k_q.stride(2), k_s.stride(1), k_s.stride(2),
+        qp, k_q, k_s, v_q, v_s, acc, m, low, mask_arg,
+        L, ns, k_q.stride(1), k_q.stride(2), k_s.stride(1), k_s.stride(2), sh_m, st_m,
         G=g, TQ=tq, D=D, ROWS=ROWS, BLOCK_L=block_l, BITS=bits,
-        SCALE=1.0 / (D ** 0.5), num_warps=4, num_stages=2)
+        SCALE=1.0 / (D ** 0.5), HAS_MASK=mask is not None, num_warps=4, num_stages=2)
     acc = acc.view(Hkv, ns, ROWS, D)
     m = m.view(Hkv, ns, ROWS)
     low = low.view(Hkv, ns, ROWS)

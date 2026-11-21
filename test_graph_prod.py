@@ -84,6 +84,9 @@ def feed2(h_prev, h0, t0, t1, pos0):
 
 @torch.inference_mode()
 def run_graph():
+    import sn_loop_common as _slc
+
+    _slc.use_fused_kv_attention(os.environ.get("SENSENOVA_FUSED") == "1")
     dec = Graph2Decoder(model, N_CTX + 80, kv_int8=True, qlen=2, pass2_bits=4)
     dec.reset()
     mtp.cache.reset()
@@ -177,4 +180,6 @@ with torch.inference_mode():
     print(f"[eager] prefill {st_e['prefill_s']:.1f}s | 解码 {st_e['decode_s']:.2f}s | "
           f"{st_e['tokens'] / st_e['decode_s']:.2f} tok/s | 整卡 {guard.peak / 1e9:.2f} GB", flush=True)
 print(f"token 一致：{tg == te[:len(tg)]}（graph {len(tg)} / eager {len(te)}）")
+print("  graph 文本:", tok.decode(tg)[:160].replace("\n", " "))
+print("  eager 文本:", tok.decode(te)[:160].replace("\n", " "))
 guard.close()

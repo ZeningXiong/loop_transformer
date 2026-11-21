@@ -35,6 +35,24 @@ class GraphKV2Layer(GraphKVLayer):
         a, b = self.cur, self.cur + t
         if b > self.max_len:
             raise RuntimeError(f"上下文已满：{self.cur} + {t} > {self.max_len}")
+        import sn_loop_common as _slc
+
+        if _slc._FUSED_KV and self.int8:
+            # 只写量化数据，注意力直接读；L 用固定 pad（图里形状不变），由掩码排除未写槽位
+            if self.bits == 4:
+                kq, ks = self._quant4(key_states)
+                vq, vs = self._quant4(value_states)
+            else:
+                kq, ks = self._quant(key_states)
+                vq, vs = self._quant(value_states)
+            self.k_q.index_copy_(2, self.idx2, kq)
+            self.k_s.index_copy_(2, self.idx2, ks)
+            self.v_q.index_copy_(2, self.idx2, vq)
+            self.v_s.index_copy_(2, self.idx2, vs)
+            self.cur = b
+            self._set_views()
+            kv = _slc.QuantKV(self.k_q, self.k_s, self.v_q, self.v_s, self.pad, self.bits)
+            return kv, kv
         ix = self.idx2
         if self.int8:
             q4 = self.bits == 4
