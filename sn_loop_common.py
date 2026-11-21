@@ -573,6 +573,22 @@ def _fixed_kv_layer_class():
         def update(self, key_states, value_states, *args, **kwargs):
             t = key_states.shape[-2]
             a, b = self.cur, self.cur + t
+            if _FUSED_KV and self.int8 and not self.recent and t <= 4:
+                # decode 阶段：只写入量化数据，不解量化；注意力直接读 k_q/k_s
+                if self.bits == 4:
+                    kq, ks = self._quant4(key_states)
+                    vq, vs = self._quant4(value_states)
+                else:
+                    kq, ks = self._quant(key_states)
+                    vq, vs = self._quant(value_states)
+                self.k_q[:, :, a:b].copy_(kq)
+                self.k_s[:, :, a:b].copy_(ks)
+                self.v_q[:, :, a:b].copy_(vq)
+                self.v_s[:, :, a:b].copy_(vs)
+                self.cur = b
+                self._set_views()
+                kv = QuantKV(self.k_q, self.k_s, self.v_q, self.v_s, b, self.bits)
+                return kv, kv
             if b > self.max_len:
                 raise ContextFull(f"上下文已满：{self.cur} + {t} > 上限 {self.max_len} token")
             if self.int8 and self.bits == 4:
@@ -718,6 +734,24 @@ def reset_cache(cache):
         layer.reset()
 
 
+class QuantKV:
+    """int8/int4 量化 KV 的轻量包装：让注意力直接读量化数据，跳过解量化到 bf16 缓冲。"""
+
+    __slots__ = ("k_q", "k_s", "v_q", "v_s", "L", "bits")
+
+    def __init__(self, k_q, k_s, v_q, v_s, L, bits):
+        self.k_q, self.k_s, self.v_q, self.v_s, self.L, self.bits = k_q, k_s, v_q, v_s, L, bits
+
+
+_FUSED_KV = False
+
+
+def use_fused_kv_attention(enable: bool = True) -> None:
+    """打开后 FixedKVLayer.update 在 decode 阶段返回 QuantKV，注意力直接读量化 KV。"""
+    global _FUSED_KV
+    _FUSED_KV = bool(enable)
+
+
 def gqa_fold_attention(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None, **kwargs):
     """Grouped-query attention without repeating K/V and without enable_gqa.
 
@@ -727,6 +761,16 @@ def gqa_fold_attention(module, query, key, value, attention_mask, dropout=0.0, s
     The kernel is forced: if it cannot run, this raises instead of silently using the O(T^2) MATH kernel.
     """
     from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    if isinstance(key, QuantKV):
+        from fused_kv_attn import attend
+
+        B, Hq, Tq, D = query.shape
+        Hkv = key.k_q.shape[1]
+        g = Hq // Hkv
+        out = attend(query.reshape(Hkv, g * Tq, D), key.k_q, key.k_s, key.v_q, key.v_s,
+                     key.L, key.bits, g, Tq)
+        return out.reshape(B, Hq, Tq, D).transpose(1, 2).contiguous(), None
 
     B, Hq, Tq, D = query.shape
     Hkv, L = key.shape[1], key.shape[2]
