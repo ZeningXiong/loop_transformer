@@ -111,15 +111,15 @@
 
 ### 3.1 第一条线：容量与内存
 
-| # | 措施 | 效果 | 技术来源 |
-|---|---|---|---|
-| 1 | **离线 NF4 量化权重** | 38 GB（FP32）→ **4.5 GB**；与 bf16 的 KL 0.146 | NF4 数据类型来自 **QLoRA** [1]；实现用 bitsandbytes（LLM.int8 系列）[2] |
-| 2 | **丢弃视觉塔** | −0.6 GB（文本任务不需要） | 工程取舍，无外部方法 |
-| 3 | **固定槽位 KV + int8 量化** | 16K 的 KV 从 bf16 约 897 MiB → **456.8 MiB** | 固定槽位/分页式 KV 管理参考 **PagedAttention (vLLM)** [6]；per-token-per-head scale 的 KV 量化参考 **KIVI** [3]、**KVQuant** [4] |
-| 4 | **第 2 遍 KV 再压到 int4** | 456.8 → **360.4 MiB**（6 个循环槽位走 4-bit） | 非对称低比特 KV 的证据来自 **KIVI** [3]；"哪些位可以低"的取舍参考 **Atom** 的混合精度思路 [5] |
-| 5 | **融合 int4 解包内核**（Triton） | 每层反量化 5.6 → **0.32 ms（17×）**，逐位一致——让"int4 不减速"成立 | 4-bit 权重高效 GEMV 的参照 **Marlin** [7]；内核框架 **Triton** [22] |
-| 6 | **MTP 头也量化成 NF4** | −0.35 GB，速度与命中率不变 | 同 [1]，作用对象换成投机头 |
-| 7 | **显存守卫 + 定期 empty_cache** | 回收约 1.1 GB 分配器碎片；97% 上限保护 | PyTorch 分配器行为 + 自建 VramGuard |
+| # | 措施 | 效果 |
+|---|---|---|
+| 1 | **离线 NF4 量化权重** | 38 GB（FP32）→ **4.5 GB**；与 bf16 的 KL 0.146 |
+| 2 | **丢弃视觉塔** | −0.6 GB（文本任务不需要） |
+| 3 | **固定槽位 KV + int8 量化** | 16K 的 KV 从 bf16 约 897 MiB → **456.8 MiB** |
+| 4 | **第 2 遍 KV 再压到 int4** | 456.8 → **360.4 MiB**（6 个循环槽位走 4-bit） |
+| 5 | **融合 int4 解包内核**（Triton） | 每层反量化 5.6 → **0.32 ms（17×）**，逐位一致——让"int4 不减速"成立 |
+| 6 | **MTP 头也量化成 NF4** | −0.35 GB，速度与命中率不变 |
+| 7 | **显存守卫 + 定期 empty_cache** | 回收约 1.1 GB 分配器碎片；97% 上限保护 |
 
 **结果**：16K 下模型**自身只占 5.4 GB**（权重 4.5 + KV 0.36 + 激活/图池），整卡 6.8–7.4 GB（含桌面程序约 1.4 GB）。
 
@@ -133,16 +133,16 @@
 
 按贡献从大到小：
 
-| # | 措施 | 效果 | 技术来源 |
-|---|---|---|---|
-| 1 | **启用折叠 GQA 注意力** | 16K 前向 **165.6 → 124.0 ms（−25%）** | GQA 本身见 **Ainslie et al.** [15]；"不复制 K/V、把 g 个查询头折叠到序列轴"是我们在 **memory-efficient SDPA** 上的实现，思路与 **FlashAttention** 的 GQA 处理一致 [16] |
-| 2 | **图（CUDA Graph）+ 2-token 投机** | 16K **16.8–17.9 tok/s**（纯贪心 9.8） | CUDA Graphs [23]；投机解码 **Leviathan et al. / Chen et al.** [17] |
-| 3 | **注意力直接读量化 KV** | 16.80 → **20.31 tok/s（+21%）** | 融合"反量化 + 注意力"的做法与 **Flash-Decoding**（split-KV 并行 + 归并）[16]、**KVQuant/KIVI** 的解量化式注意力 [3][4] 同源 |
-| 4 | **2-token MTP 自投机** | 相对贪心 **×1.4–1.67** | 多 token 预测 **Gloeckle et al.** [19]、**DeepSeek-V3 的 MTP 模块** [19]；自投机/草稿-验证范式见 **Medusa** [18]、**EAGLE** [18] |
-| 5 | **2×2 Sinkhorn 闭式解** | 一步 125 → **96.7 ms（−23%）** | 最优传输 / Sinkhorn 归一化 [10]；2×2 的闭式解由我们推导（迭代的精确极限） |
-| 6 | **int8 小批量 GEMV 修复** | 2-token 验证 **239 → 150 ms** | 8-bit 推理的分解式实现 **LLM.int8** [2]；小批量下避免整权重复量化的做法与 **Marlin** 的 per-group 反量化一致 [7] |
-| 7 | **融合 RMSNorm + SiLU×up** | 16K 前向 **−5%**，逐位一致 | RMSNorm [20]、SiLU/SwiGLU 门控 [21]；融合内核用 **Triton** [22] 实现，PTX 舍入栅栏保证与 PyTorch 逐位一致 |
-| 8 | **固定 KV 缓冲**（不再 `torch.cat`） | 免掉每步拼接，也是显存稳定的前提 | 同 [6] 的预分配槽位思想 |
+| # | 措施 | 效果 |
+|---|---|---|
+| 1 | **启用折叠 GQA 注意力** | 16K 前向 **165.6 → 124.0 ms（−25%）** |
+| 2 | **图（CUDA Graph）+ 2-token 投机** | 16K **16.8–17.9 tok/s**（纯贪心 9.8） |
+| 3 | **注意力直接读量化 KV** | 16.80 → **20.31 tok/s（+21%）** |
+| 4 | **2-token MTP 自投机** | 相对贪心 **×1.4–1.67** |
+| 5 | **2×2 Sinkhorn 闭式解** | 一步 125 → **96.7 ms（−23%）** |
+| 6 | **int8 小批量 GEMV 修复** | 2-token 验证 **239 → 150 ms** |
+| 7 | **融合 RMSNorm + SiLU×up** | 16K 前向 **−5%**，逐位一致 |
+| 8 | **固定 KV 缓冲**（不再 `torch.cat`） | 免掉每步拼接，也是显存稳定的前提 |
 
 **最终成绩**（图 + 投机 + 量化 KV）：
 
@@ -188,43 +188,19 @@
 
 ---
 
-## 五、参考文献
+## 五、与 loop transformer 直接相关的工作
 
-**量化与显存**
+本项目的优化里，只有少数几项是"循环模型特有"的；其余（量化、投机解码、融合内核、CUDA graph 等）属于通用推理工程，不在此列出。
 
-[1] Dettmers, T., Pagnoni, A., Holtzman, A., Zettlemoyer, L. *QLoRA: Efficient Finetuning of Quantized LLMs.* NeurIPS 2023.（NF4 数据类型与双重量化；本项目用 NF4、不开 double-quant）
-[2] Dettmers, T., Lewis, M., Belkada, Y., Zettlemoyer, L. *LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale.* NeurIPS 2022.
-[3] Liu, Z., Yuan, J., Jin, H., Zhong, S., Xu, Z., Braverman, V., Chen, B., Hu, X. *KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache.* ICML 2024. <https://dl.acm.org/doi/abs/10.5555/3692070.3693381>
-[4] Hooper, C., Kim, S., Mohammadzadeh, H., Mahoney, M. W., Shao, Y. S., Keutzer, K., Gholami, A. *KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization.* NeurIPS 2024.
-[5] Zhao, Y., Lin, C.-Y., Zhu, K., Ye, Z., Chen, L., Zheng, S., Ceze, L., Krishnamurthy, A., Chen, T., Kasikci, B. *Atom: Low-bit Quantization for Efficient and Accurate LLM Serving.* MLSys 2024. <https://homes.cs.washington.edu/~arvind/papers/atom-mlsys.pdf>
-[6] Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J. E., Zhang, H., Stoica, I. *Efficient Memory Management for Large Language Model Serving with PagedAttention.* SOSP 2023.（vLLM）
-[7] Frantar, E., Castro, R. L., Chen, J., Hoefler, T., Alistarh, D. *MARLIN: Mixed-Precision Auto-Regressive Parallel Inference on Large Language Models.* 2024.
+| 我们的结论 / 设计 | 对应的循环模型研究 |
+|---|---|
+| 32 个物理层跑出 **56 次层执行**、成本是同参数量模型的 1.75 倍 | 循环深度（权重共享）的早期形态：**Universal Transformers**（Dehghani et al., ICLR 2019）[1]；循环带来的表达力：**Looped Transformers as Programmable Computers**（Giannou et al., ICML 2023）[2] |
+| 循环是"省参数不省算力"，且收益递减 | **Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach**（Geiping et al., NeurIPS 2025）[3]；**Iso-Depth Scaling Laws for Looped LMs**（NeurIPS 2026）[4]：410M 循环 ≈ 580M 非循环，但训练成本 ≈ 1B |
+| 24 层线性注意力（Gated DeltaNet）的显存恒定但召回有界 | **Gated Delta Networks**（Yang, Kautz, Hatamizadeh, ICLR 2025）[5]；**Mamba-2 / SSD**（Dao & Gu, ICML 2024）[6]；"线性注意力容量有界"的解释见 **Linear Transformers Are Secretly Fast Weight Programmers**（Schlag et al., ICML 2021）[7] |
+| 只有 8 层 full attention，KV 只来自它们（循环后 14 个槽位） | **A Systematic Analysis of Hybrid Linear Attention**（Wang et al., 2026）[8]：72 个模型对照，建议线性:全局 = 3:1–6:1；低于 3:1 时召回显著改善 |
+| 循环段内的 mHC 路由（2 条流 + Sinkhorn 归一化） | Sinkhorn 归一化：[9] Sinkhorn 1964 / Cuturi, NeurIPS 2013（2×2 闭式解为自研推导） |
 
-**模型架构（线性注意力 / 循环深度）**
-
-[8] Yang, S., Kautz, J., Hatamizadeh, A. *Gated Delta Networks: Improving Mamba2 with Delta Rule.* ICLR 2025. arXiv:2412.06464.（本模型的 24 层线性注意力即 Gated DeltaNet）
-[9] Dao, T., Gu, A. *Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality.* ICML 2024.（Mamba-2 / SSD）
-[10] Sinkhorn, R. *A Relationship Between Arbitrary Positive Matrices and Doubly Stochastic Matrices.* 1964；Cuturi, M. *Sinkhorn Distances: Lightspeed Computation of Optimal Transport.* NeurIPS 2013.（mHC 路由的归一化）
-[11] Dehghani, M., Gouws, S., Vinyals, O., Uszkoreit, J., Kaiser, L. *Universal Transformers.* ICLR 2019.（层循环/权重共享的早期形态）
-[12] Giannou, A., Rajput, S., Sohn, J., Lee, K., Lee, J. D., Papailiopoulos, D. *Looped Transformers as Programmable Computers.* ICML 2023. <https://www.iclr.cc/virtual/2023/13594>
-[13] Geiping, J., McLeish, S., Jain, N., Kirchenbauer, J., Singh, S., Bartoldson, B., Kailkhura, B., Bhatele, A., Goldstein, T. *Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach.* NeurIPS 2025. <https://proceedings.nips.cc/paper_files/paper/2025/hash/3b01972cf31e6fa0fe29e4b8b5c2a0a1-Abstract-Conference.html>
-[14] *How Much Is One Recurrence Worth? Iso-Depth Scaling Laws for Looped Language Models.* NeurIPS 2026. <https://neurips.cc/virtual/2026/loc/sydney/poster/150418>（"一次循环 ≈ 多少独立参数"的定量结论）
-[24] Wang, D., Zhu, R.-J., Abreu, S., et al. *A Systematic Analysis of Hybrid Linear Attention.* arXiv:2507.06457.（72 个模型的混合比例对照；推荐 GatedDeltaNet/HGRN-2 + 3:1–6:1）<https://arxiv.org/html/2507.06457>
-[25] Schlag, I., Irie, K., Schmidhuber, J. *Linear Transformers Are Secretly Fast Weight Programmers.* ICML 2021.（线性注意力的联想记忆视角，解释"容量有界"）
-
-**注意力实现与推理加速**
-
-[15] Ainslie, J., Lee-Thorp, J., de Jong, Z., Zemlyanskiy, Y., Lebrón, F., Sanghai, S. *GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints.* EMNLP 2023.
-[16] Dao, T., Fu, D. Y., Ermon, S., Rudra, A., Ré, C. *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.* NeurIPS 2022；Dao, T. *FlashAttention-2.* 2023；Dao, T., Haziza, D., Massa, F., Sizov, G. *Flash-Decoding for Long-Context Inference.* 2023.（split-KV + 归并；本项目的 split-L 解码内核与之同源）
-[17] Leviathan, Y., Kalman, M., Matias, Y. *Fast Inference from Transformers via Speculative Decoding.* ICML 2023；Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre, L., Jumper, J. *Accelerating Large Language Model Decoding with Speculative Sampling.* 2023.
-[18] Cai, T., Li, Y., Geng, Z., et al. *Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads.* 2024；Li, Y., Wei, F., Zhang, C., Zhang, H. *EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty.* 2024.
-[19] Gloeckle, F., Idrissi, B. Y., Rozière, B., Lopez-Paz, D., Synnaeve, G. *Better & Faster Large Language Models via Multi-token Prediction.* 2024；DeepSeek-AI. *DeepSeek-V3 Technical Report.* 2024.（MTP 模块）
-[20] Zhang, B., Sennrich, R. *Root Mean Square Layer Normalization.* NeurIPS 2019.
-[21] Shazeer, N. *GLU Variants Improve Transformer.* 2020.（SiLU/SwiGLU 门控）
-[22] Tillet, P., Kung, H.-T., Cox, D. *Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations.* MAPL 2019.
-[23] NVIDIA. *CUDA Graphs*（CUDA C Programming Guide 章节）；工程实践见 TensorRT-LLM / vLLM 的图捕获路径。
-
-> 说明：以上标注为"参考/同源"的条目，指的是**方法思想的来源**；本项目在此基础上做的是面向 8 GB 单卡、Windows、循环模型的工程实现与取舍（例如只为 14 个 KV 槽位中的第二遍压到 4-bit、以及把 split-L 归并放到 torch 侧完成）。
+**一句话**：循环模型的研究目前集中在三件事上——**深度换参数是否划算（[1][2][3][4]）、线性层能记住多少（[5][6][7]）、以及和注意力怎么配比（[8]）**。本项目把这三件事在 8 GB 单卡上量化了一遍。
 
 ## 附：一句话总结
 
