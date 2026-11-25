@@ -302,6 +302,26 @@ textbox(s, Inches(0.65), Inches(5.35), Inches(12.0), Inches(1.2),
          ("定量上，一次循环折算的“等效独立参数”小于一层真参数（410M 循环 ≈ 580M 非循环，但训练成本 ≈ 1B）",
           11.5, False, GRAY)], line_spacing=1.25)
 
+# ---------- 7b ExactLoop 对照 ----------
+s = new_slide("ExactLoop 的做法，我们在同一个项目里对应到了哪一步", "2 · 相关工作")
+add_table(s, Inches(0.65), Inches(1.5), Inches(12.0), [
+    ["ExactLoop 的核心结论", "本项目的对应实现", "证据"],
+    ["“每 token 几十个小 kernel 才是真正的成本”", "我们 profile 到 2000–3000 次启动/步\n→ CUDA graph 一次重放", "8K：14.1 → 18.4 tok/s（+30%）"],
+    ["融合要放在“舍入栅栏”之后，保证逐位不变", "手写融合 RMSNorm / SiLU×up\nPTX cvt.rn.bf16.f32 做舍入栅栏", "5.6M 元素 0 差异；16K 前向 −5%"],
+    ["“近似融合并不更快，还掉 1 分 GSM8K，所以不上线”", "保留逐位一致版本；近似方案（near-miss 接受）\n实测只捞回 8% 失配、净收益 3%，放弃", "数学题 5/8 不变"],
+    ["“64 张图的 cache 防止 eager 回退”", "按长度分桶捕获（256…max_len），命中即重放", "捕获 3.7 s；16K 只需 1 张图"],
+    ["“避免 dead KV 槽位、复用 prefix 页”", "固定 14 个槽位 + 掩码排除未写位置\n第 2 遍压 int4", "16K KV 360.4 MiB"],
+], col_w=[4.2, 4.6, 3.2], font_size=10.5, row_h=Inches(0.78))
+band7b = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.65), Inches(6.05),
+                            Inches(12.0), Inches(0.72))
+band7b.fill.solid()
+band7b.fill.fore_color.rgb = LIGHT
+band7b.line.color.rgb = RGBColor(0xD9, 0xE1, 0xEC)
+band7b.adjustments[0] = 0.12
+textbox(s, Inches(0.95), Inches(6.2), Inches(11.4), Inches(0.45),
+        [("一致的三条：融合必须逐位一致、图要覆盖所有桶、死槽位要付代价；唯一没做的是 prefill–decode 分离（单机单进程用不上）。",
+          11.5, True, NAVY)])
+
 # ---------- 8 优化总览 ----------
 s = new_slide("优化历程：两条线，各自解决一个问题", "3 · 优化历程")
 kpi(s, Inches(0.65), Inches(1.7), Inches(5.85), Inches(1.6), "38 GB → 4.5 GB", "容量线：权重 NF4",
@@ -475,5 +495,10 @@ for i, sl in enumerate(slides[1:-1], start=2):
     footer(sl, i, total)
 
 out = os.path.join(HERE, "docs", "REPORT.pptx")
-prs.save(out)
+try:
+    prs.save(out)
+except PermissionError:
+    out = os.path.join(HERE, "docs", "REPORT_v2.pptx")
+    prs.save(out)
+    print("原文件被占用（可能正开在 PowerPoint 里），已改存为 REPORT_v2.pptx")
 print(f"已生成 {out}，共 {total} 页")
